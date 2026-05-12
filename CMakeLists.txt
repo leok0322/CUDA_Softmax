@@ -167,20 +167,50 @@ endif()
 #     86 = Ampere  (RTX 30 系)
 #     89 = Ada     (RTX 40 系)
 #     90 = Hopper  (H100)
+# 不设置全局 CMAKE_CUDA_ARCHITECTURES 时，有两种替代方式效果相同：
+#   1. 逐个 target 设置（每个 target 都要写一遍，繁琐）：
+#        set_target_properties(softmax_cuda PROPERTIES CUDA_ARCHITECTURES 86)
+#   2. cmake 命令行传入：
+#        cmake -DCMAKE_CUDA_ARCHITECTURES=86 ...
+#
+#   三种写法最终均展开为相同的 nvcc 标志：
+#     -gencode arch=compute_86,code=[sm_86,compute_86]
+#   全局 set 最简洁，所有 target 自动继承，无需重复指定
 set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
 message(STATUS "检测到 GPU Compute Capability: ${_GPU_CC} -> CUDA_ARCHITECTURES=${_GPU_CC_NUM}")
 
 # ── 可配置的 kernel 编译参数 ──────────────────────────────────────────────────
-# 这四个宏对应 kernels.cu 顶部的 #ifndef 默认值，通过 cmake -D 可在配置阶段覆盖
-# 等价于 torch.utils.cpp_extension.load 中的 extra_cuda_cflags / extra_cflags
+# set(<变量名> <默认值> CACHE <类型> "<描述>")
+#   与普通 set() 的区别：
+#     普通 set()      : 变量只存在于当前 cmake 运行的内存中，每次 Reload 都重新赋值
+#     CACHE set()     : 变量写入 CMakeCache.txt（构建目录下），跨 Reload 持久保存；
+#                       若用户已通过 -D 传入值，CACHE set() 不会覆盖，保留用户的值
+#   set(... CACHE ...) 与 -D 的分工：
+#     set(SOFTMAX_VARIANT 8 CACHE ...) : 提供兜底默认值，cache 里没有值时才生效
+#     -DSOFTMAX_VARIANT=6              : 用户指定值，由 CLion CMake options 或命令行传入
+#     set() 永远不会覆盖已在 cache 中的值，两者优先级：-D > cache 已有值 > set() 默认值
 #
-#   SOFTMAX_VARIANT : 选择 kernel 实现（1~9），对应 softmax_kernel1~9
-#   BLOCK_DIM_Y     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
-#   UNROLL_FACTOR   : 循环展开因子（1/2/4/8），用于 kernel7/8/9 的向量化循环
-#   WIDTH           : 行宽静态提示（0 = 运行时由参数决定），非零时允许编译器静态优化
+#   三种场景下的行为：
+#     首次 Reload，未传 -D : cache 无值 → set() 写入默认值 8 → 编译用 8
+#     Reload 时传 -DSOFTMAX_VARIANT=6 : CMake 先把 6 写入 cache → set() 检测到已有值不覆盖 → 编译用 6
+#     再次 Reload，未传 -D : cache 仍有 6（上次写入）→ set() 不覆盖 → 编译仍用 6
+#     重置为默认值         : 删除 cmake-build-release/CMakeCache.txt 后 Reload，或显式传 -DSOFTMAX_VARIANT=8
 #
-# 用法示例（选择 variant=6，block_y=512）：
-#   cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 ..
+#   类型 STRING：在 CLion / cmake-gui 中以文本框展示，可直接编辑
+#     其他常用类型：BOOL（复选框）、PATH（目录选择器）、FILEPATH（文件选择器）
+#     类型仅影响 GUI 展示方式，不影响 CMake 内部的变量处理
+#
+#   描述字符串：显示在 cmake-gui / ccmake 的变量旁边，说明该变量的用途和合法值范围
+#
+#   这四个宏对应 kernels.cu 顶部的 #ifndef 默认值，通过 cmake -D 可在配置阶段覆盖，
+#   等价于 benchmark.py 中 torch.utils.cpp_extension.load 的 extra_cuda_cflags / extra_cflags：
+#     SOFTMAX_VARIANT : 选择 kernel 实现（1~9），对应 softmax_kernel1~9
+#     BLOCK_DIM_Y     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
+#     UNROLL_FACTOR   : 循环展开因子（1/2/4/8），用于 kernel7/8/9 的向量化循环
+#     WIDTH           : 行宽静态提示（0 = 运行时由参数决定），非零时允许编译器静态优化
+#
+#   用法示例（选择 variant=6，block_y=512）：
+#     cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 ..
 set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
 set(BLOCK_DIM_Y      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
 set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
@@ -247,9 +277,19 @@ add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>")
 #     Linux/macOS : 以空格为分隔符（等价于 UNIX_COMMAND）
 #     Windows     : 以空格为分隔符并处理引号（等价于 WINDOWS_COMMAND）
 #     使用 NATIVE_COMMAND 无需关心平台差异，CMake 自动选择正确规则
+# 本机实际值（PyTorch 以 CXX11 ABI 编译，torch.compiled_with_cxx11_abi() == True）：
+#   TORCH_CXX_FLAGS     = "-D_GLIBCXX_USE_CXX11_ABI=1"        ← 空格分隔的普通字符串
+#   TORCH_CXX_FLAGS_LIST = "-D_GLIBCXX_USE_CXX11_ABI=1"       ← 拆分后的 CMake list（此处只有一项）
+#
+#   若 PyTorch 以旧 ABI 编译（compiled_with_cxx11_abi() == False）：
+#   TORCH_CXX_FLAGS     = "-D_GLIBCXX_USE_CXX11_ABI=0 -Wall"  ← 假设含多个标志
+#   TORCH_CXX_FLAGS_LIST = "-D_GLIBCXX_USE_CXX11_ABI=0;-Wall" ← 拆分为两项的 list
 separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 
 # ${TORCH_CXX_FLAGS_LIST} 展开为多个独立参数，每个编译单元（.cu / .cpp）均追加这些标志
+# 本机等价于对所有编译命令追加：-D_GLIBCXX_USE_CXX11_ABI=1
+#   nvcc kernels.cu    ... -D_GLIBCXX_USE_CXX11_ABI=1
+#   g++  interface.cpp ... -D_GLIBCXX_USE_CXX11_ABI=1
 add_compile_options(${TORCH_CXX_FLAGS_LIST})
 
 # ── .o / .so / 可执行文件 的关系 ─────────────────────────────────────────────
@@ -294,17 +334,37 @@ add_compile_options(${TORCH_CXX_FLAGS_LIST})
 #   kernels.cu    : 所有 softmax_kernelN 的 CUDA 实现
 add_library(softmax_cuda SHARED interface.cpp kernels.cu)
 
-# Python C 扩展命名规范：无 "lib" 前缀，后缀由 Python 版本和平台决定
-#   PREFIX ""：去掉默认的 "lib" 前缀，生成 softmax_cuda.so 而非 libsoftmax_cuda.so
-#   SUFFIX：使用 Python 平台扩展名（如 .cpython-311-x86_64-linux-gnu.so）
-#           确保 `import softmax_cuda` 能被 Python 正确识别
-#   若不设置 SUFFIX，Python 无法直接 import；生成的裸 .so 仍可被 ctypes 加载
+# Python C 扩展的文件命名规范：
+#   Python 解释器 import 时按固定规则搜索文件名，格式为：
+#     <模块名>.<python版本>-<平台>.so
+#   本机实际值（Python 3.13，x86_64 Linux）：
+#     softmax_cuda.cpython-313-x86_64-linux-gnu.so
+#   若文件名不符合此规范，import softmax_cuda 找不到文件，报 ModuleNotFoundError
+#
+# execute_process 调用 venv 解释器查询本机的扩展后缀：
+#   sysconfig.get_config_var('EXT_SUFFIX') 返回当前解释器对应的标准后缀
+#   本机返回：.cpython-313-x86_64-linux-gnu.so
+#   结果存入 _PY_EXT_SUFFIX，OUTPUT_STRIP_TRAILING_WHITESPACE 去掉末尾换行
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
     OUTPUT_VARIABLE _PY_EXT_SUFFIX
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
 )
+
+# set_target_properties(<target> PROPERTIES <属性名> <值>)：设置 target 的文件名属性
+#   执行前的默认文件名（CMake 对 SHARED 库的默认规则）：
+#     PREFIX = "lib"，SUFFIX = ".so"  →  libsoftmax_cuda.so
+#   执行后：
+#     PREFIX = ""，SUFFIX = ".cpython-313-x86_64-linux-gnu.so"  →  softmax_cuda.cpython-313-x86_64-linux-gnu.so
+#
+#   PREFIX ""  : 去掉 CMake 对共享库默认添加的 "lib" 前缀
+#                不设置则产物为 libsoftmax_cuda.so，Python 无法识别
+#   SUFFIX ... : 将后缀替换为 Python 标准扩展名，覆盖默认的裸 ".so"
+#                两者合并后产物名为：softmax_cuda.cpython-313-x86_64-linux-gnu.so
+#
+#   查询失败（ERROR_QUIET 静默，_PY_EXT_SUFFIX 为空）时只去前缀，保留裸 .so，
+#   产物为 softmax_cuda.so，Python 无法直接 import，但仍可用 ctypes.CDLL() 加载
 if(_PY_EXT_SUFFIX)
     set_target_properties(softmax_cuda PROPERTIES PREFIX "" SUFFIX "${_PY_EXT_SUFFIX}")
     message(STATUS "Python extension suffix: ${_PY_EXT_SUFFIX}")
@@ -313,9 +373,48 @@ else()
     message(WARNING "无法检测 Python 扩展后缀，生成裸 .so；若需直接 import，请手动重命名")
 endif()
 
-# 四个 kernel 参数宏作为编译期常量注入，等价于 -DSOFTMAX_VARIANT=8 等
+# target_compile_definitions(<target> <范围> <宏定义列表>)
+#   将宏定义注入指定 target 的编译命令，等价于给编译器追加 -D<宏名>=<值>
+#
+#   执行阶段说明：
+#     set(SOFTMAX_VARIANT 8 CACHE ...)      ← 配置阶段（Reload）：把值存入 CMakeCache.txt
+#     target_compile_definitions(... ${SOFTMAX_VARIANT}) ← 配置阶段（Reload）：读取 CMake 变量，
+#                                                           把 -DSOFTMAX_VARIANT=8 写入 build.ninja
+#     nvcc 编译 kernels.cu                  ← 编译阶段（Build）预处理步骤：
+#                                             读取 build.ninja 中的 -DSOFTMAX_VARIANT=8，
+#                                             #ifndef SOFTMAX_VARIANT 条件为假，跳过默认值，
+#                                             使用传入的 8，后续编译 / 汇编 / 链接均使用此值
+#   即：target_compile_definitions 本身在配置阶段执行（写 build.ninja），
+#       对 kernels.cu 的实际影响发生在编译阶段的预处理器步骤，两者不在同一阶段
+#
+#   与 add_compile_options 的区别：
+#     add_compile_options     : 对所有 target 全局生效
+#     target_compile_definitions : 只对指定 target（softmax_cuda）生效，不影响其他 target
+#
+#   PRIVATE：宏定义只作用于 softmax_cuda 自身的编译
+#     PUBLIC    : 自身编译 + 传递给链接了此 target 的其他 target
+#     INTERFACE : 只传递，自身不用（用于纯头文件库）
+#     本项目是叶子 target（无其他 target 链接它），PRIVATE / PUBLIC 效果相同，
+#     用 PRIVATE 更准确，明确表示不对外传递
+#
+#   各宏定义展开为编译器标志（本机默认值示例）：
+#     TORCH_EXTENSION_NAME=softmax_cuda  →  -DTORCH_EXTENSION_NAME=softmax_cuda
+#     BLOCK_DIM_Y=${BLOCK_DIM_Y}         →  -DBLOCK_DIM_Y=1024
+#     UNROLL_FACTOR=${UNROLL_FACTOR}     →  -DUNROLL_FACTOR=8
+#     SOFTMAX_VARIANT=${SOFTMAX_VARIANT} →  -DSOFTMAX_VARIANT=8
+#     WIDTH=${WIDTH}                     →  -DWIDTH=0
+#
+#   在 kernels.cu 中，#ifndef 保护被这些 -D 标志覆盖：
+#     #ifndef BLOCK_DIM_Y
+#     #define BLOCK_DIM_Y 1024   ← 若未传 -D，用此默认值
+#     #endif
+#     编译时收到 -DBLOCK_DIM_Y=1024，#ifndef 条件为假，跳过此块，直接使用传入值
+#
 #   TORCH_EXTENSION_NAME：PYBIND11_MODULE 宏展开时使用此名称作为 Python 模块名
-#                          必须与库文件名（softmax_cuda）一致，否则 import 时报 ImportError
+#     必须与库文件名（softmax_cuda）一致，否则 import 时报 ImportError：
+#       import softmax_cuda  →  Python 加载 softmax_cuda.cpython-313-...so
+#                            →  寻找模块入口 PyInit_softmax_cuda
+#                            →  若 TORCH_EXTENSION_NAME 不同，入口名不匹配，加载失败
 target_compile_definitions(softmax_cuda PRIVATE
     TORCH_EXTENSION_NAME=softmax_cuda
     BLOCK_DIM_Y=${BLOCK_DIM_Y}
@@ -342,10 +441,21 @@ target_link_libraries(softmax_cuda PRIVATE
     ${TORCH_PYTHON_LIBRARY}
 )
 
-# CUDA 设备代码也使用 C++17（与主机代码标准保持一致，避免模板实例化差异）
+# set_target_properties 与全局 set(CMAKE_CXX_STANDARD 20) 的区别：
+#   作用范围：
+#     set(CMAKE_CXX_STANDARD 20)                          : 全局，所有 target 继承
+#     set_target_properties(softmax_cuda PROPERTIES ...) : 只作用于 softmax_cuda，
+#                                                          优先级高于全局值，可单独覆盖
+#   CUDA_STANDARD 无对应全局变量：
+#     CMAKE_CXX_STANDARD 只影响 .cpp 的编译，CMake 没有全局 CMAKE_CUDA_STANDARD 自动同步机制；
+#     不显式设置 CUDA_STANDARD 时，nvcc 编译 kernels.cu 的设备代码退回默认标准（C++14），
+#     与主机代码标准不一致，模板实例化时出现难以定位的错误
+#   CXX_STANDARD 20 在本项目中是冗余的：
+#     全局已有 CMAKE_CXX_STANDARD 20，softmax_cuda 会自动继承，
+#     此处显式写出只是让意图更清晰；真正必要的只有 CUDA_STANDARD 20
 set_target_properties(softmax_cuda PROPERTIES
-    CXX_STANDARD  20
-    CUDA_STANDARD 20
+    CXX_STANDARD  20   # 冗余但明确：interface.cpp 用 C++20 编译（继承自 CMAKE_CXX_STANDARD）
+    CUDA_STANDARD 20   # 必要：kernels.cu 设备代码也用 C++20，无全局变量可继承
 )
 
 # ════════════════════════════════════════════════════════════════════════════
