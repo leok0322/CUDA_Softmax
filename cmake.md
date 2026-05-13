@@ -433,8 +433,8 @@ TORCH_CXX_FLAGS_LIST = "-D_GLIBCXX_USE_CXX11_ABI=1"       ← 拆分后的 CMake
 等价于对所有编译命令追加：
 
 ```
-nvcc kernels.cu    ... -D_GLIBCXX_USE_CXX11_ABI=1
-g++  interface.cpp ... -D_GLIBCXX_USE_CXX11_ABI=1
+nvcc src/kernels.cu    ... -D_GLIBCXX_USE_CXX11_ABI=1
+g++  src/interface.cpp ... -D_GLIBCXX_USE_CXX11_ABI=1
 ```
 
 ---
@@ -444,7 +444,7 @@ g++  interface.cpp ... -D_GLIBCXX_USE_CXX11_ABI=1
 ### add_library
 
 ```cmake
-add_library(softmax_cuda SHARED interface.cpp kernels.cu)
+add_library(softmax_cuda SHARED src/interface.cpp src/kernels.cu)
 ```
 
 构建为 SHARED 库而非可执行文件，Python `import` 时动态加载 `.so`：
@@ -634,9 +634,9 @@ python3 → import softmax_cuda → dlopen(softmax_cuda.so) → 函数可调用
 **本项目 `add_library(softmax_cuda SHARED ...)`：**
 
 ```
-interface.cpp  ──(g++)──▶  interface.cpp.o  ─┐
-                                              ├─(ld)──▶  softmax_cuda.so  ← 无入口，须由 python3 dlopen 加载
-kernels.cu     ──(nvcc)─▶  kernels.cu.o     ─┘
+src/interface.cpp  ──(g++)──▶  interface.cpp.o  ─┐
+                                                 ├─(ld)──▶  softmax_cuda.so  ← 无入口，须由 python3 dlopen 加载
+src/kernels.cu     ──(nvcc)─▶  kernels.cu.o     ─┘
   含 SASS（sm_86）和 PTX（compute_86）两段，均嵌入 .o，链接后进入 .so
 ```
 

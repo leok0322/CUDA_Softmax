@@ -352,7 +352,7 @@ add_compile_options(${TORCH_CXX_FLAGS_LIST})
 # 构建为 SHARED 库而非可执行文件，Python import 时动态加载 .so
 #   interface.cpp : pybind11 模块定义（PYBIND11_MODULE + torch::Tensor 绑定）
 #   kernels.cu    : 所有 softmax_kernelN 的 CUDA 实现
-add_library(softmax_cuda SHARED interface.cpp kernels.cu)
+add_library(softmax_cuda SHARED src/interface.cpp src/kernels.cu)
 
 # Python C 扩展的文件命名规范：
 #   Python 解释器 import 时按固定规则搜索文件名，格式为：
