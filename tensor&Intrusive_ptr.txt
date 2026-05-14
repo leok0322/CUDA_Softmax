@@ -1,0 +1,2584 @@
+================================================================================
+torch::Tensor / intrusive_ptr / C++ 特殊成员函数 — 完整笔记
+================================================================================
+
+--------------------------------------------------------------------------------
+一、torch::Tensor：句柄（handle），不是数据本身
+--------------------------------------------------------------------------------
+
+torch::Tensor 是一个轻量级句柄，内部只持有一个引用计数智能指针，不存储实际数据。
+
+内部结构：
+  torch::Tensor
+    └─ intrusive_ptr<TensorImpl>   ← 引用计数智能指针（侵入式）
+         └─ TensorImpl
+              ├─ Storage           ← 实际 GPU 内存块（data_ptr 指向这里）
+              ├─ sizes[]           ← 各维度大小，如 [h, w]
+              ├─ strides[]         ← 各维度步长（字节数），决定内存布局
+              ├─ dtype             ← 元素类型（float / double 等）
+              ├─ device            ← cuda:0 / cpu 等
+              └─ ref_count         ← 引用计数，降为 0 时释放 Storage
+
+拷贝语义（浅拷贝）：
+  torch::Tensor b = a;
+    → 只复制句柄，ref_count++，a 和 b 指向同一块 GPU 内存
+  按值传参同理：softmax_cu(torch::Tensor x) 传入时拷贝句柄，开销 O(1)
+
+深拷贝（需要独立副本时）：
+  torch::Tensor b = a.clone();
+    → 分配新内存并复制数据，ref_count 各自独立
+
+empty_like 的语义：
+  auto out = torch::empty_like(x);
+    → out 与 x 共享同一 TensorImpl 结构（shape/dtype/device），
+      但 empty_like 分配独立的 Storage（新的 GPU 内存块），ref_count 从 1 开始
+
+--------------------------------------------------------------------------------
+二、torch::Tensor、intrusive_ptr<TensorImpl>、TensorImpl 三者关系
+--------------------------------------------------------------------------------
+
+【2.1 层次结构总览】
+
+  ┌──────────────────────────────────────────────────────┐
+  │  torch::Tensor（栈上，8 bytes）                        │
+  │  ─────────────────────────────────────────────────── │
+  │  impl_: intrusive_ptr<TensorImpl, ...>               │
+  │              │                                       │
+  │              │ ptr_: TensorImpl*（8 bytes 裸指针）     │
+  │              ▼                                       │
+  │  ┌─────────────────────────────────────────────┐     │
+  │  │  TensorImpl（堆上，继承 intrusive_ptr_target） │     │
+  │  │  ─────────────────────────────────────────── │    │
+  │  │  refcount_  : atomic<uint32_t>               │    │
+  │  │  weakcount_ : atomic<uint32_t>               │    │
+  │  │  storage_   : Storage                        │    │
+  │  │    └─ data_ptr → GPU/CPU 内存                 │    │
+  │  │  sizes_     : SmallVector<int64_t>           │    │
+  │  │  strides_   : SmallVector<int64_t>           │    │
+  │  │  dtype_     : caffe2::TypeMeta               │    │
+  │  │  device_    : Device                         │    │
+  │  └──────────────────────────────────────────────┘    │
+  └──────────────────────────────────────────────────────┘
+
+【2.2 简化的实际类定义】
+
+  // TensorImpl 继承 intrusive_ptr_target，使引用计数内嵌
+  class TensorImpl : public intrusive_ptr_target {
+  public:
+      Storage  storage_;
+      sizes_t  sizes_;
+      sizes_t  strides_;
+      TypeMeta dtype_;
+      Device   device_;
+      // ... 约几十个字段
+  };
+
+  // torch::Tensor 只有一个成员
+  class Tensor {
+      intrusive_ptr<TensorImpl, UndefinedTensorImpl> impl_;
+      //                        ^^^^^^^^^^^^^^^^^^^
+      //                        空 Tensor 时使用的哨兵对象（而非 nullptr）
+  public:
+      // 所有 .size(), .data_ptr(), .dtype() 等都委托给 impl_->xxx
+      int64_t size(int64_t dim) const { return impl_->sizes_[dim]; }
+      void*   data_ptr()        const { return impl_->storage_.data(); }
+  };
+
+
+【2.3 三者关系表】
+
+  | 对象               | 位置      | 大小          | 作用                               |
+  |--------------------|-----------|---------------|------------------------------------|
+  | torch::Tensor      | 栈（通常）| 8 bytes       | 轻量句柄，所有操作的入口           |
+  | intrusive_ptr<...> | 嵌入 Tensor | 8 bytes     | 引用计数管理，持有裸指针 ptr_      |
+  | TensorImpl         | 堆        | ~200+ bytes   | 真正的数据描述符 + 引用计数        |
+  | Storage/data       | 堆/VRAM   | 数据大小      | 实际存储内容                       |
+
+  传递关系（从外到内）：
+    torch::Tensor  ──owns──▶  intrusive_ptr<TensorImpl>
+    intrusive_ptr  ──ptr_──▶  TensorImpl*（裸指针，指向堆）
+    TensorImpl     ──继承──▶  intrusive_ptr_target（含 refcount_）
+    TensorImpl     ──持有──▶  Storage ──持有──▶ data_ptr（GPU 内存）
+
+【2.4 按值传参全链路追踪】
+
+  Python：
+    tensor = torch.rand(128, 4096)   # 创建 TensorImpl，refcount = 1
+
+  C++ 函数调用：
+    softmax_cu(torch::Tensor x)      # x 是按值传参
+
+    ① torch::Tensor 拷贝构造被调用
+    ② 内部 intrusive_ptr 拷贝构造：ptr_ = impl_.ptr_，retain_() → refcount = 2
+    ③ TensorImpl 和 GPU 内存不动
+    ④ x 可正常访问 x.data_ptr()、x.size() 等（通过 impl_.ptr_ 间接访问）
+    ⑤ 函数返回：x 析构 → intrusive_ptr 析构 → release_() → refcount = 1
+    ⑥ Python 端 tensor 仍存活，GPU 内存安全
+
+  开销分析：
+    拷贝 torch::Tensor = 复制 8 bytes 指针 + 一次原子 fetch_add + 一次原子 fetch_sub
+    GPU 内存（通常 MB~GB 级）全程不动
+
+【2.5 Python → GPU 内存完整链】
+
+  Python tensor 对象（PyObject）
+    └─ THPVariable（pybind11 wrapper）
+         └─ torch::Tensor（C++ 句柄）
+              └─ intrusive_ptr<TensorImpl>
+                   └─ TensorImpl（堆上）
+                        ├─ refcount_（Python引用 + C++引用之和）
+                        └─ Storage
+                             └─ data_ptr → CUDA malloc 分配的 GPU 显存
+
+  refcount_ 的来源：
+    +1 per Python 变量引用（由 THPVariable 管理）
+    +1 per C++ torch::Tensor 实例（由 intrusive_ptr 管理）
+    +1 per C++ intrusive_ptr<TensorImpl> 实例（直接持有者）
+    降为 0 时：~TensorImpl() → ~Storage() → cudaFree(data_ptr)
+
+
+
+【2.6 torch::Tensor 与 intrusive_ptr 的关系总结】
+
+  Python: tensor = torch.rand(128, 4096)
+    │
+    │ pybind11 / THPVariable
+    ▼
+  C++: torch::Tensor（句柄，8 bytes，栈上）
+    │
+    │ 内部持有
+    ▼
+  intrusive_ptr<TensorImpl>（8 bytes，指针）
+    │
+    │ 指向
+    ▼
+  TensorImpl（堆上）
+    ├─ refcount_（通常 = Python引用数 + C++引用数）
+    └─ Storage
+         └─ data_ptr → GPU 内存（CUDA malloc）
+
+  按值传参 softmax_cu(torch::Tensor x)：
+    → 拷贝 torch::Tensor 句柄（8 bytes）
+    → intrusive_ptr 拷贝构造，refcount++
+    → TensorImpl 和 GPU 内存不动
+    → 函数返回时 x 析构，refcount--
+
+
+--------------------------------------------------------------------------------
+三、完整引用计数生命周期示例
+--------------------------------------------------------------------------------
+
+  // new TensorImpl，refcount = 0
+  TensorImpl* raw = new TensorImpl(...);
+
+  // 包装进 intrusive_ptr，retain_()，refcount = 1
+  intrusive_ptr<TensorImpl> p1(raw);
+
+  // 拷贝构造，retain_()，refcount = 2
+  intrusive_ptr<TensorImpl> p2 = p1;
+
+  // 移动构造，refcount 不变 = 2，p2 变为 null
+  intrusive_ptr<TensorImpl> p3 = std::move(p2);
+
+  // p2 析构，ptr_ 为 null，无操作，refcount = 2
+  // （p2 在此作用域结束后析构）
+
+  // p3 析构，release_()，refcount = 2 → 1
+  // p1 析构，release_()，refcount = 1 → 0 → delete TensorImpl → GPU 内存释放
+
+--------------------------------------------------------------------------------
+四、torch::Tensor 与 intrusive_ptr 的关系总结
+--------------------------------------------------------------------------------
+
+  Python: tensor = torch.rand(128, 4096)
+    │
+    │ pybind11 / THPVariable
+    ▼
+  C++: torch::Tensor（句柄，8 bytes，栈上）
+    │
+    │ 内部持有
+    ▼
+  intrusive_ptr<TensorImpl>（8 bytes，指针）
+    │
+    │ 指向
+    ▼
+  TensorImpl（堆上）
+    ├─ refcount_（通常 = Python引用数 + C++引用数）
+    └─ Storage
+         └─ data_ptr → GPU 内存（CUDA malloc）
+
+  按值传参 softmax_cu(torch::Tensor x)：
+    → 拷贝 torch::Tensor 句柄（8 bytes）
+    → intrusive_ptr 拷贝构造，refcount++
+    → TensorImpl 和 GPU 内存不动
+    → 函数返回时 x 析构，refcount--
+
+--------------------------------------------------------------------------------
+五、torch::Tensor 完整实现
+--------------------------------------------------------------------------------
+
+  // ── 辅助类型（简化，对应 PyTorch 真实类型）──────────────────────────────────
+  using sizes_t   = c10::SmallVector<int64_t, 5>;  // 大多数 Tensor ≤ 5 维
+  using strides_t = c10::SmallVector<int64_t, 5>;
+
+  struct Storage {
+      void*    data_ptr_;   // 指向 CPU / GPU 内存
+      size_t   nbytes_;     // 字节数
+      Device   device_;
+      void* data() const noexcept { return data_ptr_; }
+  };
+
+  struct TypeMeta { /* 描述元素类型，如 float32 / int64 */ };
+  struct Device   { DeviceType type; int8_t index; };  // CPU / CUDA:0 / CUDA:1 ...
+
+  // ── TensorImpl（被管理对象，必须继承 intrusive_ptr_target）─────────────────
+  class TensorImpl : public intrusive_ptr_target {
+  public:
+      Storage    storage_;
+      sizes_t    sizes_;
+      strides_t  strides_;
+      TypeMeta   dtype_;
+      Device     device_;
+      bool       requires_grad_{false};
+      bool       is_leaf_{true};
+      // ... 实际还有约 20+ 个字段（grad_fn, version_counter 等）
+
+      // 构造：由工厂函数（at::empty / at::ones 等）负责分配 storage_
+      explicit TensorImpl(Storage s, TypeMeta dtype, Device device)
+          : storage_(std::move(s)), dtype_(dtype), device_(device) {}
+
+      virtual ~TensorImpl() = default;   // 虚析构保证派生类正确析构
+  };
+
+  // ── UndefinedTensorImpl（NullType 哨兵，全局单例）─────────────────────────
+  struct UndefinedTensorImpl : public TensorImpl {
+      static UndefinedTensorImpl _singleton;    // 程序生命周期内唯一实例
+
+      // 所有方法返回"未定义"语义的安全值
+      bool is_contiguous() const override { return true; }
+
+      static UndefinedTensorImpl* singleton() noexcept { return &_singleton; }
+  };
+
+  // ── torch::Tensor 完整实现 ────────────────────────────────────────────────
+  class Tensor {
+      // 唯一数据成员：8 bytes（64位平台）
+      // 空 Tensor：impl_.ptr_ == UndefinedTensorImpl::singleton()
+      // 非空 Tensor：impl_.ptr_ == 某个堆上 TensorImpl*
+      intrusive_ptr<TensorImpl, UndefinedTensorImpl> impl_;
+
+  public:
+
+      // ── 构造 / 析构 ──────────────────────────────────────────────────────
+
+      // 默认构造：impl_.ptr_ 指向 UndefinedTensorImpl 单例，不 retain_()
+      Tensor() = default;
+      //   defined() == false；任何数据访问均安全返回默认值
+
+      // 从裸指针构造（内部工厂使用）：retain_() → refcount 0→1
+      explicit Tensor(TensorImpl* impl)
+          : impl_(intrusive_ptr<TensorImpl, UndefinedTensorImpl>(impl)) {}
+
+      // 从已有 intrusive_ptr 构造（最常见的内部路径）
+      explicit Tensor(intrusive_ptr<TensorImpl, UndefinedTensorImpl> impl)
+          : impl_(std::move(impl)) {}
+
+      // 拷贝构造：impl_ 拷贝构造 → retain_() → refcount++
+      Tensor(const Tensor&)            = default;
+      // 移动构造：impl_ 移动构造 → 源 ptr_ 置为 UndefinedTensorImpl → refcount 不变
+      Tensor(Tensor&&)                 = default;
+      // 拷贝赋值：retain 新 → release 旧 → ptr_ 更新
+      Tensor& operator=(const Tensor&) = default;
+      // 移动赋值：release 旧 → ptr_ = 源 ptr_ → 源置为 UndefinedTensorImpl
+      Tensor& operator=(Tensor&&)      = default;
+      // 析构：impl_ 析构 → release_() → refcount--；降为 0 时 delete TensorImpl
+      ~Tensor()                        = default;
+
+      // ── 元数据访问（全部委托给 impl_）────────────────────────────────────
+
+      // 是否为有效 Tensor（ptr_ != UndefinedTensorImpl 单例）
+      bool defined() const noexcept {
+          return impl_.defined();
+          // intrusive_ptr::defined() ≡ ptr_ != NullType::singleton()
+      }
+
+      // 维度数
+      int64_t dim() const {
+          return static_cast<int64_t>(impl_->sizes_.size());
+      }
+
+      // 第 dim 维的大小，负索引同 Python：-1 = 最后一维
+      int64_t size(int64_t dim) const {
+          if (dim < 0) dim += this->dim();
+          return impl_->sizes_[dim];
+      }
+
+      // 所有维度大小（返回 IntArrayRef，轻量视图，不拷贝）
+      IntArrayRef sizes() const noexcept {
+          return impl_->sizes_;
+      }
+
+      // 元素总数：所有维度大小之积
+      int64_t numel() const noexcept {
+          int64_t n = 1;
+          for (auto s : impl_->sizes_) n *= s;
+          return n;
+      }
+
+      // 第 dim 维的步长（元素间隔，以元素数计）
+      int64_t stride(int64_t dim) const {
+          if (dim < 0) dim += this->dim();
+          return impl_->strides_[dim];
+      }
+
+      IntArrayRef strides() const noexcept { return impl_->strides_; }
+
+      // ── 类型 / 设备 ────────────────────────────────────────────────────
+
+      TypeMeta   dtype()       const noexcept { return impl_->dtype_; }
+      ScalarType scalar_type() const noexcept { return typeMetaToScalarType(impl_->dtype_); }
+      Device     device()      const noexcept { return impl_->device_; }
+      bool       is_cuda()     const noexcept { return impl_->device_.type == DeviceType::CUDA; }
+      bool       is_cpu()      const noexcept { return impl_->device_.type == DeviceType::CPU; }
+
+      // ── 数据指针 ────────────────────────────────────────────────────────
+
+      // 返回 void*，指向 CPU/GPU 内存的首元素
+      void* data_ptr() const { return impl_->storage_.data(); }
+
+      // 类型化版本（T 必须与实际 dtype 匹配，否则 UB）
+      template <typename T>
+      T* data_ptr() const {
+          return static_cast<T*>(impl_->storage_.data());
+      }
+
+      // ── 梯度 / 自动微分 ────────────────────────────────────────────────
+
+      bool requires_grad() const noexcept { return impl_->requires_grad_; }
+      bool is_leaf()       const noexcept { return impl_->is_leaf_; }
+
+      // ── 连续性 ────────────────────────────────────────────────────────
+
+      // 默认内存顺序（行主序）下是否连续
+      bool is_contiguous() const noexcept {
+          // 简化：实际会检查 strides 是否与 sizes 构成 C-contiguous 关系
+          int64_t expected = 1;
+          for (int64_t i = dim() - 1; i >= 0; --i) {
+              if (impl_->strides_[i] != expected) return false;
+              expected *= impl_->sizes_[i];
+          }
+          return true;
+      }
+
+      // ── 底层访问（内部/扩展用）─────────────────────────────────────────
+
+      TensorImpl* unsafeGetTensorImpl() const noexcept { return impl_.get(); }
+      const intrusive_ptr<TensorImpl, UndefinedTensorImpl>& getIntrusivePtr() const noexcept {
+          return impl_;
+      }
+  };
+
+  /*
+   调用链示意（以 tensor.size(0) 为例）：
+
+     torch::Tensor t = ...;
+     t.size(0)
+       → Tensor::size(0)           // 用户调用 Tensor 的方法
+         → impl_->sizes_[0]        // impl_ 即 intrusive_ptr，operator-> 返回 TensorImpl*
+                                   // 等价于 (impl_.ptr_)->sizes_[0]
+                                   // 没有 control block，没有额外间接，一次解引用
+  */
+
+--------------------------------------------------------------------------------
+六、intrusive_ptr — 侵入式引用计数智能指针
+--------------------------------------------------------------------------------
+
+【6.1 与 shared_ptr 的根本区别】
+
+shared_ptr<TensorImpl>：
+  ┌─────────────┐        ┌──────────────────┐
+  │  shared_ptr │──ptr──▶│   TensorImpl     │
+  │             │        │   (数据)          │
+  └──────┬──────┘        └──────────────────┘
+         │ ctrl
+         ▼
+  ┌──────────────┐
+  │ control block│  ← 额外的堆分配
+  │ refcount = 1 │
+  │ weakcount= 0 │
+  └──────────────┘
+
+intrusive_ptr<TensorImpl>：
+  ┌──────────────────┐
+  │   TensorImpl     │
+  │   (数据)          │
+  │   refcount = 1   │  ← 引用计数内嵌在对象内部
+  │   weakcount= 0   │
+  └──────────────────┘
+
+shared_ptr 的引用计数在对象外部单独分配；
+intrusive_ptr 的引用计数在对象内部，因此得名"侵入式"（intrusive）。
+
+关键差异：
+
+| 维度               | intrusive_ptr          | shared_ptr                              |
+|--------------------|------------------------|-----------------------------------------|
+| 成员数             | 1个指针（8 bytes）     | 2个指针（16 bytes）                     |
+| 构造开销           | 无额外分配             | 多一次 new ControlBlock                 |
+| make_shared 优化   | 不需要                 | 将对象和 control block 合并为一次分配   |
+| 裸指针重新包装     | 安全（计数在对象内）   | 危险（重置计数，与已有 shared_ptr 失联）|
+| 缓存局部性         | refcount 与数据相邻    | refcount 在独立内存块，可能 cache miss  |
+| 侵入性要求         | T 必须继承基类         | T 无需修改                              |
+
+make_shared 优化后的布局（仍不如 intrusive_ptr）：
+
+  make_shared<TensorImpl>() 内存布局：
+    ┌──────────────────────────────────────────────────┐
+    │ use_count │ weak_count │ TensorImpl（数据字段…） │  ← 一次 new，连续内存
+    └──────────────────────────────────────────────────┘
+         ▲                        ▲
+         ctrl_（指针1）            ptr_（指针2）         ← shared_ptr 句柄仍有两个指针
+
+  intrusive_ptr<TensorImpl> 内存布局：
+    ┌──────────────────────────────────────────────────┐
+    │ refcount_ │ weakcount_ │ TensorImpl（数据字段…） │  ← 计数内嵌对象，也是连续内存
+    └──────────────────────────────────────────────────┘
+         ▲
+         ptr_（唯一指针）                               ← intrusive_ptr 句柄只有一个指针
+
+  make_shared 与 intrusive_ptr 布局相似，但句柄的指针数不同：
+  | 句柄成员数 | shared_ptr           | intrusive_ptr |
+  |------------|----------------------|---------------|
+  | 指针数     | 2（ptr_ + ctrl_）    | 1（ptr_）     |
+  | sizeof     | 16 bytes             | 8 bytes       |
+
+  make_shared 示例：
+
+    // 一次分配：control block 和 TensorImpl 相邻
+    auto sp = std::make_shared<TensorImpl>(...);
+    // sp.use_count() == 1
+
+    auto sp2 = sp;               // 拷贝，use_count == 2，共享同一 control block
+    TensorImpl* raw = sp.get();  // 取出裸指针
+
+    // 危险：从裸指针再构造 shared_ptr
+    std::shared_ptr<TensorImpl> sp3(raw);
+    // sp3 创建了全新的 control block，use_count 独立为 1
+    // sp/sp2 的 use_count 仍为 2，与 sp3 互不知情
+
+    // sp/sp2 离开作用域：use_count 2→1→0 → delete raw → TensorImpl 被销毁
+    // sp3  离开作用域：use_count 1→0 → delete raw → 双重释放！未定义行为
+
+  make_shared 无法解决裸指针重新包装的问题，
+  因为 control block 的地址存在 shared_ptr 句柄内（ctrl_ 字段），
+  从裸指针无法找回原来的 control block。
+
+
+--------------------------------------------------------------------------------
+七、intrusive_ptr 完整实现
+--------------------------------------------------------------------------------
+
+【7.0 三种智能指针的句柄与内存布局对比】
+
+  | 构造方式            | 句柄指针数 | 句柄大小 | 堆分配次数 | T 与计数是否相邻 |
+  |---------------------|-----------|---------|-----------|-----------------|
+  | shared_ptr(new T)   | 2         | 16 bytes | 2次       | 否              |
+  | make_shared<T>()    | 2         | 16 bytes | 1次       | 是              |
+  | intrusive_ptr<T>    | 1         | 8 bytes  | 0次额外   | 是（内嵌于 T）  |
+
+  shared_ptr(new T)：两次独立 malloc，内存不连续
+    句柄[ ptr_ ][ ctrl_ ]  →  堆①[ T 对象 ]
+                           →  堆②[ use_count | weak_count | vptr ]
+
+  make_shared<T>()：一次 malloc，内存连续，但句柄仍有两个指针
+    句柄[ ptr_ ][ ctrl_ ]  →  堆①[ use_count | weak_count | vptr | T 对象 ]
+                                      ↑ ctrl_ 指向这里        ↑ ptr_ 指向这里
+
+  intrusive_ptr<T>：句柄只有一个指针，refcount_ 内嵌在 T 内部
+    句柄[ ptr_ ]           →  堆①[ refcount_ | weakcount_ | T 数据字段 ]
+                                      ↑ 通过 ptr_->refcount_ 直接访问，无 control block
+
+【7.1 基类：intrusive_ptr_target】
+
+被管理对象必须继承此基类，引用计数内嵌在对象内部。
+
+  class intrusive_ptr_target {
+      mutable std::atomic<uint32_t> refcount_{0};
+      mutable std::atomic<uint32_t> weakcount_{0};
+
+      template <typename T> friend class intrusive_ptr;
+
+      void retain_() const noexcept {
+          // memory_order_relaxed：只保证原子性，无需跨线程同步
+          // （计数增加不涉及数据可见性，relaxed 足够）
+          refcount_.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      void release_() const noexcept {
+          // memory_order_acq_rel：
+          //   acq：确保其他线程对对象的写入在此可见（读最新数据后再判断是否释放）
+          //   rel：确保本线程的写入在 release 前对其他线程可见（释放前不重排）
+          if (refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+              delete this;  // 触发虚析构，派生类资源按继承链逐层释放
+          }
+      }
+
+  protected:
+      virtual ~intrusive_ptr_target() = default;
+  };
+
+【7.2 intrusive_ptr<T, NullType> — 两个模板参数】
+
+  ── 为什么 Tensor 里写的是 intrusive_ptr<TensorImpl, UndefinedTensorImpl>？ ─────
+
+  PyTorch 的 intrusive_ptr 实际签名有两个模板参数：
+
+    template <typename T,
+              typename NullType = detail::intrusive_target_default_null_type<T>>
+    class intrusive_ptr { ... };
+
+  第一个参数 T：被管理的对象类型（必须继承 intrusive_ptr_target）。
+  第二个参数 NullType：定义"空/null"状态用什么值表示，默认行为等同于 nullptr。
+
+  ── NullType 的作用 ──────────────────────────────────────────────────────────
+
+  默认情况（NullType = 默认）：
+    空的 intrusive_ptr 的 ptr_ == nullptr。
+    解引用空指针 → 崩溃（undefined behavior）。
+
+  PyTorch 不使用默认，而是：
+    NullType = UndefinedTensorImpl
+
+  UndefinedTensorImpl 是一个全局单例（null object pattern），作用：
+    · 默认构造的 torch::Tensor 内部 ptr_ 指向这个单例，而非 nullptr
+    · tensor.defined() 返回 false（检测到 ptr_ == &UndefinedTensorImpl::_singleton）
+    · tensor.dim()、tensor.dtype() 等调用不会 nullptr 崩溃，而是返回合理的默认值
+    · 避免在每次操作前手写 if (tensor.defined()) 判断
+
+  // 简化：UndefinedTensorImpl 的结构
+  struct UndefinedTensorImpl : public TensorImpl {
+      static UndefinedTensorImpl _singleton;   // 全局唯一实例
+      // 重写各方法，返回安全默认值
+      bool is_contiguous() const override { return true; }
+      IntArrayRef sizes() const override { return {}; }
+      // ...
+  };
+
+  ── intrusive_ptr<T, NullType> 内部如何使用 NullType ────────────────────────
+
+  // "空"不再是 nullptr，而是 NullType 的 singleton
+  T* ptr_;
+
+  // 默认构造：ptr_ 指向 NullType::singleton()，而非 nullptr
+  intrusive_ptr() noexcept : ptr_(NullType::singleton()) {
+      // NullType::singleton() 对默认 NullType 返回 nullptr
+      // 对 UndefinedTensorImpl 返回 &UndefinedTensorImpl::_singleton
+  }
+
+  // "是否为空"的判断
+  bool defined() const noexcept {
+      return ptr_ != NullType::singleton();
+  }
+
+  ── 对比：简化版（文件中已实现）vs PyTorch 真实版 ────────────────────────
+
+  | 版本         | 模板参数        | 空状态           | 空解引用结果     |
+  |--------------|----------------|-----------------|-----------------|
+  | 简化版        | template<T>    | ptr_ == nullptr  | 崩溃（UB）       |
+  | PyTorch 真实  | template<T, NullType> | ptr_ == UndefinedTensorImpl* | 返回默认值 |
+
+  文件中的 template<typename T> 实现已足够理解 intrusive_ptr 的核心机制；
+  NullType 是 PyTorch 在此基础上加的空对象模式扩展，二者结构完全相同。
+
+【7.3 intrusive_ptr<T> 全部特殊成员（简化版实现）】
+
+  template <typename T>   // T 必须继承自 intrusive_ptr_target
+  class intrusive_ptr {
+      T* ptr_;            // 唯一成员，sizeof(intrusive_ptr) == 8 bytes（64位）
+
+  public:
+
+      // ── 默认构造 ──────────────────────────────────────────────────────────
+      intrusive_ptr() noexcept : ptr_(nullptr) {}
+      //   refcount 不变（无对象）
+
+      // ── 从裸指针构造 ──────────────────────────────────────────────────────
+      explicit intrusive_ptr(T* ptr) noexcept : ptr_(ptr) {
+          if (ptr_) ptr_->retain_();   // refcount: 0 → 1
+      }
+      //   new TensorImpl 后 refcount 为 0，包装进 intrusive_ptr 后变为 1
+      //   explicit 阻止隐式转换，防止意外的所有权转移（见第四节）
+
+      // ── 拷贝构造 ──────────────────────────────────────────────────────────
+      intrusive_ptr(const intrusive_ptr& other) noexcept : ptr_(other.ptr_) {
+          if (ptr_) ptr_->retain_();   // refcount++，两者共享同一对象
+      }
+      //   torch::Tensor b = a;  →  拷贝句柄，refcount: 1 → 2
+
+      // ── 移动构造 ──────────────────────────────────────────────────────────
+      intrusive_ptr(intrusive_ptr&& other) noexcept : ptr_(other.ptr_) {
+          other.ptr_ = nullptr;        // 源置空，refcount 不变
+      }
+      //   torch::Tensor b = std::move(a);  →  refcount 保持 1，a 变为 null
+      //   比拷贝构造少一次原子操作（无 retain_）
+
+      // ── 拷贝赋值 ──────────────────────────────────────────────────────────
+      intrusive_ptr& operator=(const intrusive_ptr& other) noexcept {
+          if (ptr_ != other.ptr_) {
+              if (other.ptr_) other.ptr_->retain_();  // 先 retain 新对象
+              if (ptr_)       ptr_->release_();       // 再 release 旧对象
+              ptr_ = other.ptr_;
+          }
+          //   顺序关键：若先 release 再 retain，自赋值时可能误触 delete
+          return *this;
+      }
+
+      // ── 移动赋值 ──────────────────────────────────────────────────────────
+      intrusive_ptr& operator=(intrusive_ptr&& other) noexcept {
+          if (ptr_) ptr_->release_();  // release 当前持有的对象
+          ptr_ = other.ptr_;
+          other.ptr_ = nullptr;        // 源置空，refcount 不变
+          return *this;
+      }
+
+      // ── 析构 ──────────────────────────────────────────────────────────────
+      ~intrusive_ptr() noexcept {
+          if (ptr_) ptr_->release_();  // refcount--，降为 0 时 delete ptr_
+      }
+
+      T* get()        const noexcept { return ptr_; }
+      T& operator*()  const noexcept { return *ptr_; }
+      T* operator->() const noexcept { return ptr_; }
+      explicit operator bool() const noexcept { return ptr_ != nullptr; }
+  };
+
+【7.4 shared_ptr 实现对比】
+
+  struct ControlBlock {
+      std::atomic<long> use_count{1};
+      std::atomic<long> weak_count{1};  // +1 表示 shared_ptr 自身持有一个 weak 引用
+      virtual void destroy()    = 0;    // 销毁被管理对象
+      virtual void deallocate() = 0;    // 销毁 control block 自身
+  };
+
+  template <typename T>
+  class shared_ptr {
+      T*            ptr_;   // 指向被管理对象  ┐ 两个成员
+      ControlBlock* ctrl_;  // 指向 control block  ┘ sizeof = 16 bytes
+
+      // 从裸指针构造：需要额外堆分配 control block
+      explicit shared_ptr(T* ptr)
+          : ptr_(ptr), ctrl_(new ControlBlock()) {}  // 额外一次 new
+
+      // 析构：两步检查
+      ~shared_ptr() noexcept {
+          if (!ctrl_) return;
+          if (ctrl_->use_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+              ctrl_->destroy();     // 销毁对象（T 的析构）
+              // weak_ptr 可能还存活，weak_count 不一定为 0
+              if (ctrl_->weak_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                  ctrl_->deallocate();  // 所有 weak_ptr 也消亡，才能释放 control block
+          }
+      }
+  };
+
+
+--------------------------------------------------------------------------------
+八、PyTorch 用 intrusive_ptr 的核心原因：
+--------------------------------------------------------------------------------
+
+  Python 端持有 Tensor 对象，C++ 端同时持有 TensorImpl* 裸指针，
+  两者需要共享同一个引用计数。
+  intrusive_ptr 天然支持（计数在对象内，任何时候包装都读同一计数），
+  shared_ptr 做不到（从裸指针重新构造会重置计数，导致双重释放）。
+
+  ── shared_ptr 的失败示例 ────────────────────────────────────────────────────
+
+    // 模拟 Python 端创建 Tensor，C++ 端拿到裸指针的场景
+    TensorImpl* raw = new TensorImpl(...);
+
+    // Python 端（THPVariable / pybind11）用 shared_ptr 管理
+    std::shared_ptr<TensorImpl> python_ref(raw);
+    // 在堆上分配 control block A，python_ref.use_count() == 1
+
+    // C++ 内核代码拿到裸指针，需要再次包装
+    std::shared_ptr<TensorImpl> cpp_ref(raw);
+    // 又在堆上分配 control block B，cpp_ref.use_count() == 1
+    // 此时内存中存在两个独立的 control block，都指向同一个 raw
+
+    //   control block A: use_count=1  ──┐
+    //   control block B: use_count=1  ──┤──▶ TensorImpl（同一对象）
+    //                                   │
+    //   两者互不知情，各自维护独立计数 ──┘
+
+    // Python 引用消亡：
+    python_ref.reset();
+    // control block A: use_count 1→0 → delete raw → TensorImpl 析构，内存释放
+
+    // C++ 引用消亡：
+    cpp_ref.reset();
+    // control block B: use_count 1→0 → delete raw → 双重释放！
+    // 程序崩溃或产生不可预期的内存错误
+
+  ── intrusive_ptr 的正确行为 ─────────────────────────────────────────────────
+
+    TensorImpl* raw = new TensorImpl(...);
+    // TensorImpl 继承 intrusive_ptr_target，raw->refcount_ == 0（初始值）
+
+    // Python 端包装
+    intrusive_ptr<TensorImpl> python_ref(raw);
+    // retain_() → raw->refcount_ == 1
+    // 计数存储在 TensorImpl 对象内部，没有额外堆分配
+
+    // C++ 端拿到同一裸指针，再次包装
+    intrusive_ptr<TensorImpl> cpp_ref(raw);
+    // retain_() → raw->refcount_ == 2
+    // 读取的是同一个 refcount_，两个句柄共享同一计数
+
+    // Python 引用消亡：
+    python_ref.reset();
+    // release_() → raw->refcount_ == 1（不为 0，不 delete）
+
+    // C++ 引用消亡：
+    cpp_ref.reset();
+    // release_() → raw->refcount_ == 0 → delete raw → 正确释放，只析构一次
+
+  关键差异：
+    shared_ptr 的计数在 control block 里，control block 地址在句柄的 ctrl_ 字段，
+    从裸指针无法定位原有 control block → 只能新建一个 → 双重释放。
+    intrusive_ptr 的计数在对象内部，从裸指针直接访问 raw->refcount_，
+    无论包装多少次，始终读写同一个计数 → 永远正确。
+
+--------------------------------------------------------------------------------
+九、shared_ptr、make_shared、weak_ptr、unique_ptr
+--------------------------------------------------------------------------------
+
+【9.1 shared_ptr / weak_ptr / unique_ptr 实现】
+
+── ControlBlock（shared_ptr 和 weak_ptr 共用）──────────────────────────────────
+
+  struct ControlBlock {
+      std::atomic<long> use_count{1};   // shared_ptr 数量（强引用）
+      std::atomic<long> weak_count{1};  // weak_ptr 数量 + 1（+1 由 shared 持有方贡献）
+      //                                   只要 use_count > 0，weak_count 额外保留 1
+
+      virtual void destroy()    = 0;    // 析构并释放 T 对象
+      virtual void deallocate() = 0;    // 释放 control block 自身
+      virtual ~ControlBlock()   = default;
+  };
+
+  // shared_ptr<T>(new T) 使用的 control block 实现（持有裸指针）
+  template <typename T>
+  struct CtrlBlockPtr : ControlBlock {
+      T* ptr_;
+      explicit CtrlBlockPtr(T* p) : ptr_(p) {}
+      void destroy()    override { delete ptr_; }          // 释放 T 的内存
+      void deallocate() override { delete this; }          // 释放 control block 的内存
+  };
+
+  // make_shared<T> 使用的 control block 实现（T 内嵌在同一块内存中）
+  template <typename T>
+  struct CtrlBlockInplace : ControlBlock {
+      alignas(T) unsigned char storage_[sizeof(T)];
+      //  ↑                    ↑        ↑
+      //  对齐说明符            原始字节  字节数 = T 的大小
+      //
+      // ── 逐元素拆解 ─────────────────────────────────────────────────────────
+      //
+      // sizeof(T)
+      //   编译期常量，T 对象占用的字节数。
+      //   sizeof(int) = 4，sizeof(double) = 8，sizeof(string) = 32（典型值）
+      //
+      // unsigned char storage_[sizeof(T)]
+      //   一个原始字节数组，大小恰好能容纳一个 T 对象。
+      //   为什么用 unsigned char[] 而不直接用 T storage_？
+      //     T storage_  → 在 CtrlBlockInplace 构造时立即调用 T 的默认构造函数，
+      //                   在析构时自动调用 ~T()，无法控制构造/析构时机。
+      //     unsigned char[]  → 只是原始字节，不触发任何构造/析构，
+      //                        T 的构造由后续定位 new 手动控制，
+      //                        T 的析构由 destroy() 手动调用 get()->~T()。
+      //
+      // alignas(T)
+      //   指定 storage_ 的内存对齐要求与 T 相同（即 alignof(T) 字节对齐）。
+      //   为什么需要？
+      //     不同类型有不同的对齐要求：
+      //       char   → alignof = 1（任意地址）
+      //       int    → alignof = 4（4 字节倍数地址）
+      //       double → alignof = 8（8 字节倍数地址）
+      //     unsigned char 自身 alignof = 1，若不加 alignas(T)，
+      //     storage_ 可能从奇数地址开始，在其上构造 double 等类型会导致：
+      //       ① 未定义行为（x86 某些模式下崩溃）
+      //       ② 性能损失（非对齐访问需多次内存读取）
+      //     alignas(T) 强制 storage_ 的起始地址满足 T 的对齐要求。
+      //
+      // 对比：
+      //   T              storage_;   // 自动构造/析构，无法分离时机，不适合此场景
+      //   unsigned char  storage_[sizeof(T)];          // 无对齐保证，可能崩溃
+      //   alignas(T) unsigned char storage_[sizeof(T)]; // ✓ 正确：手动控制+对齐保证
+      //
+      // 等价的标准写法（C++11）：
+      //   std::aligned_storage_t<sizeof(T), alignof(T)> storage_;
+      //   两者效果完全相同，aligned_storage 是对上述惯用法的封装。
+
+      T* get() { return reinterpret_cast<T*>(storage_); }
+      //   将字节数组的地址重新解释为 T*，合法前提：
+      //   storage_ 已通过定位 new 构造了有效的 T 对象，且地址已按 alignas(T) 对齐。
+
+      void destroy()    override { get()->~T(); }
+      //   只调析构函数，不释放内存（storage_ 和 control block 同属一块 malloc）
+
+      void deallocate() override { delete this; }
+      //   整块内存（control block 头 + storage_ 中的 T 字节）一起归还给系统
+  };
+
+
+
+── shared_ptr<T> ────────────────────────────────────────────────────────────────
+
+  template <typename T>
+  class shared_ptr {
+      T*            ptr_;    // 指向 T 对象
+      ControlBlock* ctrl_;   // 指向 control block
+
+  public:
+      // 默认构造
+      shared_ptr() noexcept : ptr_(nullptr), ctrl_(nullptr) {}
+
+      // 从裸指针构造：分配新 ControlBlock
+      explicit shared_ptr(T* ptr)
+          : ptr_(ptr), ctrl_(ptr ? new CtrlBlockPtr<T>(ptr) : nullptr) {}
+      //   use_count=1, weak_count=1
+
+      // 拷贝构造：共享同一 control block，use_count++
+      shared_ptr(const shared_ptr& o) noexcept : ptr_(o.ptr_), ctrl_(o.ctrl_) {
+          if (ctrl_) ctrl_->use_count.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      // 移动构造：转移所有权，不修改计数
+      shared_ptr(shared_ptr&& o) noexcept : ptr_(o.ptr_), ctrl_(o.ctrl_) {
+          o.ptr_ = nullptr;
+          o.ctrl_ = nullptr;
+      }
+
+      // 拷贝赋值
+      shared_ptr& operator=(const shared_ptr& o) noexcept {
+          if (ctrl_ != o.ctrl_) {
+              release_();
+              ptr_  = o.ptr_;
+              ctrl_ = o.ctrl_;
+              if (ctrl_) ctrl_->use_count.fetch_add(1, std::memory_order_relaxed);
+          }
+          return *this;
+      }
+
+      // 移动赋值
+      shared_ptr& operator=(shared_ptr&& o) noexcept {
+          release_();
+          ptr_ = o.ptr_;   ctrl_ = o.ctrl_;
+          o.ptr_ = nullptr; o.ctrl_ = nullptr;
+          return *this;
+      }
+
+      ~shared_ptr() { release_(); }
+
+      T* get()        const noexcept { return ptr_; }
+      T& operator*()  const noexcept { return *ptr_; }
+      T* operator->() const noexcept { return ptr_; }
+      long use_count() const noexcept {
+          return ctrl_ ? ctrl_->use_count.load(std::memory_order_relaxed) : 0;
+      }
+      void reset() noexcept { release_(); ptr_ = nullptr; ctrl_ = nullptr; }
+
+  private:
+      void release_() noexcept {
+          if (!ctrl_) return;
+          if (ctrl_->use_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+              ctrl_->destroy();     // use_count 降为 0 → 销毁 T 对象
+              // 移除 shared 持有方贡献的那个 +1
+              if (ctrl_->weak_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                  ctrl_->deallocate();   // weak_count 也降为 0 → 释放 control block
+          }
+      }
+
+      // weak_ptr::lock() 专用：直接接管已递增的 use_count，不再 +1
+      shared_ptr(T* ptr, ControlBlock* ctrl) noexcept : ptr_(ptr), ctrl_(ctrl) {}
+      friend class weak_ptr<T>;
+  };
+
+── weak_ptr<T> ──────────────────────────────────────────────────────────────────
+
+  template <typename T>
+  class weak_ptr {
+      T*            ptr_;    // 指向 T 对象（不拥有，仅用于 lock() 构造 shared_ptr）
+      ControlBlock* ctrl_;   // 指向 control block（读 use_count，管理 weak_count）
+
+  public:
+      weak_ptr() noexcept : ptr_(nullptr), ctrl_(nullptr) {}
+
+      // 从 shared_ptr 构造：weak_count++，不影响 use_count
+      weak_ptr(const shared_ptr<T>& sp) noexcept : ptr_(sp.ptr_), ctrl_(sp.ctrl_) {
+          if (ctrl_) ctrl_->weak_count.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      // 拷贝构造
+      weak_ptr(const weak_ptr& o) noexcept : ptr_(o.ptr_), ctrl_(o.ctrl_) {
+          if (ctrl_) ctrl_->weak_count.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      // 移动构造
+      weak_ptr(weak_ptr&& o) noexcept : ptr_(o.ptr_), ctrl_(o.ctrl_) {
+          o.ptr_ = nullptr; o.ctrl_ = nullptr;
+      }
+
+      ~weak_ptr() { release_(); }
+
+      bool expired() const noexcept { return use_count() == 0; }
+
+      long use_count() const noexcept {
+          return ctrl_ ? ctrl_->use_count.load(std::memory_order_relaxed) : 0;
+      }
+
+      // lock()：原子地检查 use_count 并递增，成功则返回有效 shared_ptr
+      shared_ptr<T> lock() const noexcept {
+          if (!ctrl_) return shared_ptr<T>();
+          long cnt = ctrl_->use_count.load(std::memory_order_relaxed);
+          while (cnt > 0) {
+              // CAS：若 use_count 仍为 cnt，则原子地 +1 并返回 shared_ptr
+              if (ctrl_->use_count.compare_exchange_weak(
+                      cnt, cnt + 1,
+                      std::memory_order_acq_rel,
+                      std::memory_order_relaxed))
+                  return shared_ptr<T>(ptr_, ctrl_);  // 用私有构造，不再 +1
+              // CAS 失败说明其他线程刚修改了 use_count，cnt 已被更新，重试
+          }
+          return shared_ptr<T>();   // use_count 已为 0，对象已销毁
+      }
+
+      void reset() noexcept { release_(); ptr_ = nullptr; ctrl_ = nullptr; }
+
+  private:
+      void release_() noexcept {
+          if (!ctrl_) return;
+          // weak_count--；若降为 0，释放 control block
+          if (ctrl_->weak_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
+              ctrl_->deallocate();
+      }
+  };
+
+─────────────   weak_ptr 详解 ───────────────────────────
+
+weak_ptr 是 shared_ptr 的非拥有观察者：它能看到对象，但不影响 use_count，
+不阻止对象被销毁。
+
+① 基本概念与构造
+
+    shared_ptr<T> sp = make_shared<T>(...);  // use_count=1, weak_count=1（额外+1）
+    weak_ptr<T>   wp = sp;                   // use_count=1, weak_count=2
+    //                                          wp 只让 weak_count++，不影响 use_count
+
+    weak_ptr 不能直接访问对象（没有 operator* 和 operator->），
+    必须先转换为 shared_ptr 才能使用：
+
+    shared_ptr<T> sp2 = wp.lock();   // 若对象仍存活，返回有效 shared_ptr
+                                     // 若对象已销毁，返回 nullptr（空 shared_ptr）
+
+② lock() 的原子语义
+
+    lock() 的核心问题：在"检查 use_count"和"use_count++"之间，
+    另一个线程可能让 use_count 降为 0 并 delete 对象。
+
+    lock() 用一次原子的"比较并交换"解决：
+      if (use_count > 0) { use_count++; return shared_ptr(this); }
+      else               { return nullptr; }
+    整个操作是原子的，不可能读到 use_count=1 之后、+1 之前对象被 delete。
+
+    示例：
+      std::weak_ptr<T> wp = sp;
+
+      // 线程安全的使用方式：
+      if (auto locked = wp.lock()) {
+          locked->do_something();   // 在这个作用域内对象保证存活
+      }   // locked 析构，use_count--
+
+      // 错误的使用方式（TOCTOU 竞态）：
+      if (!wp.expired()) {
+          wp.lock()->do_something();   // expired() 和 lock() 之间对象可能被销毁
+      }
+
+③ expired() 与 use_count()
+
+    wp.expired()     → 等价于 wp.use_count() == 0，对象是否已销毁
+    wp.use_count()   → 返回当前 use_count（观察用，不作同步依据）
+
+    注意：expired() 返回 true 后，对象已销毁，不可再 lock()。
+          expired() 返回 false 时，对象仍存活，但 lock() 之前随时可能变 true。
+          因此业务代码应直接用 lock() 的返回值判断，不要先 expired() 再 lock()。
+
+④ 主要用途：打破循环引用
+
+    // 循环引用：shared_ptr 互持 → 两个对象的 use_count 永远不为 0 → 内存泄漏
+    struct Node {
+        shared_ptr<Node> next;   // 强引用：持有下一个节点
+    };
+
+    auto a = make_shared<Node>();
+    auto b = make_shared<Node>();
+    a->next = b;   // b 的 use_count = 2
+    b->next = a;   // a 的 use_count = 2
+
+    // a、b 离开作用域，外部 use_count 各 -1，变为 1，但互相持有，永远不降为 0
+    // → 两个 Node 对象都无法销毁，内存泄漏
+
+    // 修复：其中一个方向改用 weak_ptr（语义上的"观察者"方向）
+    struct Node {
+        shared_ptr<Node> next;   // 强引用：拥有下一个节点
+        weak_ptr<Node>   prev;   // 弱引用：观察上一个节点，不拥有
+    };
+
+    auto a = make_shared<Node>();
+    auto b = make_shared<Node>();
+    a->next = b;   // b 的 use_count = 2
+    b->prev = a;   // a 的 use_count 不变（weak_ptr 不影响 use_count）
+
+    // a 离开作用域：a 的 use_count 1→0（b->prev 是 weak_ptr，不计入）→ a 销毁
+    // a 销毁时 a->next 析构：b 的 use_count 2→1→0 → b 销毁
+    // 无泄漏
+
+⑤ 与 control block 的关系
+
+    weak_ptr 持有的是 control block 的指针，而非对象指针：
+
+      weak_ptr<T> 内部：
+        T*            ptr_;   // 指向 T 对象（用于 lock() 返回，但不管理生命周期）
+        ControlBlock* ctrl_;  // 指向 control block（读 use_count，管理 weak_count）
+
+    当 use_count=0、T 对象已销毁后，weak_ptr 的 ctrl_ 仍然有效（control block 还在），
+    因此 wp.expired() / wp.lock() 能安全访问 use_count 而不会崩溃。
+
+    control block 的完整生命周期：
+      创建：第一个 shared_ptr 构造时创建
+      存活：只要 use_count > 0 或 weak_count > 0
+      销毁：use_count=0 且 weak_count=0（所有 shared_ptr 和 weak_ptr 均消亡）
+
+⑥ 汇总：三种指针的对比
+
+  | 属性               | shared_ptr          | weak_ptr              | unique_ptr        |
+  |--------------------|---------------------|-----------------------|-------------------|
+  | 拥有对象           | 是（共享）          | 否（只观察）          | 是（独占）        |
+  | 影响 use_count     | 是                  | 否                    | 无 use_count      |
+  | 影响 weak_count    | 是（额外+1）        | 是                    | 无 weak_count     |
+  | 直接访问对象       | operator* / ->      | 需先 lock()           | operator* / ->    |
+  | 对象销毁后状态     | 不存在（早已析构）  | expired()=true        | 不存在            |
+  | 循环引用场景       | 会泄漏              | 用于打破循环          | 不适用            |
+  | control block      | 有                  | 有（共享同一个）      | 无                |
+
+── make_shared<T> ────────────────────────────────────────────────────────────────
+
+  make_shared 在一次堆分配中同时构造 ControlBlock 和 T 对象，
+  使用 CtrlBlockInplace<T>（T 内嵌在 control block 相邻内存中）。
+
+  // CtrlBlockInplace：make_shared 专用的 control block，T 存储紧随其后
+  template <typename T>
+  struct CtrlBlockInplace : ControlBlock {
+
+      alignas(T) unsigned char storage_[sizeof(T)];
+      //   alignas(T)：强制 storage_ 按 alignof(T) 对齐，满足 T 的内存对齐要求
+      //               （unsigned char 自身 alignof=1，不加则可能导致未定义行为）
+      //   unsigned char[]：原始字节，不触发任何构造/析构
+      //   sizeof(T)：T 所需字节数，编译期常量
+      //   此时 storage_[] 只是预留空间，T 尚未构造
+
+      T* get() {
+          return reinterpret_cast<T*>(storage_);
+          // 将字节数组地址重新解释为 T*
+          // 合法前提：storage_[] 已通过定位 new 构造了有效的 T 对象
+      }
+
+      void destroy() override {
+          get()->~T();
+          // 手动调用 T 的析构函数（定位 new 构造的对象必须手动析构）
+          // 只析构，不 free：storage_[] 和 control block 同属一块 malloc 内存
+      }
+
+      void deallocate() override {
+          delete this;
+          // 整块内存（ControlBlock 头部 + storage_[] 字节）一起归还给系统
+          // 对应步骤1 的 new CtrlBlockInplace<T>()
+      }
+  };
+
+  // make_shared 实现：
+  template <typename T, typename... Args>
+  shared_ptr<T> make_shared(Args&&... args) {
+
+      // ── 步骤1：普通 new，一次分配整块内存 ──────────────────────────────────
+      CtrlBlockInplace<T>* cb = new CtrlBlockInplace<T>();
+      //   malloc 分配 sizeof(CtrlBlockInplace<T>) 字节，构造 ControlBlock 头部：
+      //     use_count = 1，weak_count = 1，vptr → CtrlBlockInplace<T>::vtable
+      //   堆内存此刻布局：
+      //     [ use_count | weak_count | vptr | storage_[sizeof(T)] ]
+      //       ↑ 已初始化（ControlBlock 构造完成）  ↑ 未初始化原始字节，T 尚未构造
+      //
+      //   storage_[] 只是一块对齐的原始字节，没有 T 对象，
+      //   此时读取 cb->get() 指向的内存是未定义行为。
+
+      // ── 步骤2：定位 new，在 storage_[] 上原地构造 T ────────────────────────
+      new (cb->storage_) T(std::forward<Args>(args)...);
+      //
+      //   逐元素拆解：
+      //
+      //   new (cb->storage_)
+      //     定位 new 语法：new (地址) 类型(参数)
+      //     括号内是已有内存的地址，告诉编译器"在这里构造，不要分配新内存"
+      //     cb->storage_ 是 alignas(T) unsigned char[] 的首地址，
+      //     已在步骤1与 ControlBlock 同块 malloc，地址满足 T 的对齐要求
+      //
+      //   T
+      //     要构造的类型，即 make_shared<T> 中的模板参数
+      //     编译器在 cb->storage_ 地址处调用 T 的构造函数
+      //
+      //   std::forward<Args>(args)...
+      //     ┌─ Args    ：模板参数包，每个元素记录对应实参的原始类型
+      //     ├─ args    ：函数参数包，存储实际传入的参数值
+      //     ├─ forward ：按 Args 中记录的类型决定转发方式：
+      //     │              Args[i] 是左值引用 → static_cast<Args[i]&>(args[i])   → 左值
+      //     │              Args[i] 是非引用   → static_cast<Args[i]&&>(args[i])  → 右值
+      //     └─ ...     ：包展开，将参数包逐一展开传给 T 的构造函数
+      //
+      //   完整展开示例：make_shared<Foo>(a, std::move(b), 42)
+      //     Args = <int&, Foo, int>      （a 是左值→int&，move(b)是右值→Foo，42是右值→int）
+      //     args = (a, b, 42)
+      //     展开后等价于：new (storage_) Foo(a, std::move(b), 42)
+      //       ① forward<int&>(a)     → a       （左值引用，Foo 构造函数收到 int&）
+      //       ② forward<Foo>(b)      → move(b) （右值，Foo 构造函数收到 Foo&&，触发移动）
+      //       ③ forward<int>(42)     → 42      （右值，Foo 构造函数收到 int&&）
+      //
+      //   若不用 forward 直接写 T(args...)：
+      //     args 是具名参数，无论原始实参是左值还是右值，传入都退化为左值
+      //     → 右值实参的移动语义丢失，触发拷贝构造而非移动构造
+      //
+      //   执行后：storage_[] 内存中存在完整有效的 T 对象
+      //   堆内存此刻布局：
+      //     [ use_count | weak_count | vptr | T 对象（已构造） ]
+      //       ↑ ControlBlock 头部（步骤1）    ↑ T 对象（步骤2）
+
+      // ── 步骤3：构造 shared_ptr 并返回 ──────────────────────────────────────
+      return shared_ptr<T>(cb->get(), cb);
+      //
+      //   逐元素拆解：
+      //
+      //   cb->get()
+      //     返回 reinterpret_cast<T*>(storage_)
+      //     即步骤2定位 new 构造好的 T 对象的地址（storage_[] 首地址重解释为 T*）
+      //
+      //   cb
+      //     CtrlBlockInplace<T>* 指针，指向步骤1分配的整块内存（ControlBlock 头部）
+      //     隐式转换为 ControlBlock*（向上转型，安全）
+      //
+      //   shared_ptr<T>(T*, ControlBlock*)
+      //     调用的是 shared_ptr 的私有构造函数（非 explicit shared_ptr(T*) 的那个）：
+      //
+      //       shared_ptr(T* ptr, ControlBlock* ctrl) noexcept
+      //           : ptr_(ptr), ctrl_(ctrl) {}
+      //       // 直接接管已有的 ptr 和 ctrl，不再对 use_count 做任何操作
+      //
+      //     为什么不用公有构造函数 shared_ptr(T* ptr)？
+      //       公有构造：new CtrlBlockPtr<T>(ptr) → 额外分配一个新 ControlBlock → 错误
+      //                 use_count 从 1 开始（新 ControlBlock 的），与步骤1的 cb 脱节
+      //       私有构造：直接绑定步骤1已有的 cb，use_count 沿用 cb 里的 1，正确
+      //
+      //     make_shared 能访问私有构造函数的方式（实现中二选一）：
+      //       ① shared_ptr 将 make_shared 声明为 friend：
+      //            template<typename U, typename... A>
+      //            friend shared_ptr<U> make_shared(A&&...);
+      //       ② make_shared 内部通过 allocate_shared / 内部工厂方法间接调用
+      //
+      //   use_count 的状态：
+      //     步骤1 new CtrlBlockInplace → ControlBlock 构造，use_count 初始化为 1
+      //     步骤3 私有构造 shared_ptr  → 直接接管，use_count 保持 1，不再 +1
+      //     若用公有构造或拷贝构造，use_count 会被再次 +1 变为 2，导致计数错误
+      //
+      //   内存全景（步骤3完成后）：
+      //     堆：[ use_count=1 | weak_count=1 | vptr | T对象 ]
+      //                ↑                              ↑
+      //          ctrl_（ControlBlock*）           ptr_（T*）
+      //          两个指针指向同一块 malloc 内存的不同位置
+  }
+
+  两次构造做的是完全不同的事：
+
+    | 步骤 | 代码                          | 分配内存 | 构造内容                    |
+    |------|-------------------------------|---------|----------------------------|
+    | 1    | new CtrlBlockInplace<T>()     | 是      | ControlBlock 头部（计数+vptr）|
+    | 2    | new (cb->storage_) T(args...) | 否      | T 对象本身                  |
+
+  析构顺序与构造完全对称：
+
+    destroy()    → get()->~T()   // 对应步骤2：手动析构 T（定位 new 必须手动析构）
+    deallocate() → delete this   // 对应步骤1：释放整块内存（control block + storage_）
+
+  定位 new（placement new）说明：
+
+    普通 new：分配内存 + 构造对象
+      T* p = new T(args...);    // malloc(sizeof(T)) → 调用 T(args...)
+
+    定位 new：在已有内存上构造对象，不分配新内存
+      char buf[sizeof(T)];
+      T* p = new (buf) T(args...);   // 直接在 buf 上调用 T(args...)，无 malloc
+      p->~T();                        // 必须手动析构（不能 delete p，内存不是 new 的）
+
+    make_shared 用定位 new 将 T 构造在 CtrlBlockInplace::storage_[] 内，
+    使 T 对象和 control block 共享同一块 malloc 分配的内存。
+
+  std::forward<Args>(args)... 说明：
+
+    make_shared<T>(arg1, arg2) → T(arg1, arg2)
+    Args&&... 是转发引用包，forward 保持每个参数的值类别：
+      传入左值 → forward 转为左值引用 → T 的构造函数收到左值引用
+      传入右值 → forward 转为右值引用 → T 的构造函数收到右值引用，触发移动构造
+
+    不用 forward 直接传 args：所有参数都会变成左值（具名参数），
+    右值参数的移动语义丢失，可能引发不必要的拷贝。
+
+  make_shared vs shared_ptr(new T) 内存对比：
+
+    shared_ptr<T>(new T(...))：
+      malloc①: [ T 对象 ]                   ← new T 分配
+      malloc②: [ use_count | weak_count | vptr | ptr_→T ]  ← new CtrlBlockPtr 分配
+      两块内存地址不相邻，各自独立释放
+
+    make_shared<T>(...)：
+      malloc①: [ use_count | weak_count | vptr | T 对象 ]  ← 一次分配，连续内存
+      T 对象紧随 control block，ptr_ 指向同块内存内的 T
+
+【9.2 make_shared 与 shared_ptr 直接构造的区别】
+
+两者都产生 shared_ptr<T>，但内部实现路径不同：
+
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │ shared_ptr<T>(new T(...))                                                 │
+  │   第1次 new：分配并构造 T 对象，返回裸指针 raw                           │
+  │   第2次 new：分配 control block，将 raw 记录其中                         │
+  │                                                                           │
+  │   堆内存：[T 对象]  [control block]  ← 两块独立内存，地址不相邻          │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │ make_shared<T>(...)                                                       │
+  │   第1次 new（也是唯一一次）：分配 sizeof(control block) + sizeof(T) 字节 │
+  │   在这块内存上原地构造 control block 和 T 对象                           │
+  │                                                                           │
+  │   堆内存：[control block | T 对象]  ← 一块连续内存                       │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+① 性能：分配次数
+
+    // 两次堆分配
+    auto sp = std::shared_ptr<TensorImpl>(new TensorImpl(...));
+    //         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //         new TensorImpl → 1次分配
+    //         new ControlBlock（内部）→ 1次分配
+    //         共 2次 malloc，2次 free
+
+    // 一次堆分配
+    auto sp = std::make_shared<TensorImpl>(...);
+    //         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //         内部一次分配：sizeof(ControlBlock) + sizeof(TensorImpl)
+    //         共 1次 malloc，1次 free（但见下方③的注意事项）
+
+② 异常安全
+
+    // 危险写法（C++17 之前严格来说有问题）：
+    void foo(shared_ptr<T> a, shared_ptr<T> b);
+    foo(shared_ptr<T>(new T), shared_ptr<T>(new T));
+    // 编译器可能按如下顺序执行：
+    //   new T（第1个） → new T（第2个） → 构造 shared_ptr（第1个） → ...
+    // 若第2个 new T 抛异常，第1个 new T 的内存无人管理 → 泄漏
+
+    // 安全写法：
+    foo(make_shared<T>(), make_shared<T>());
+    // make_shared 将 new 和 shared_ptr 构造合并为原子操作，不存在上述风险
+
+③ 内存释放时机的差异（make_shared 的代价）
+
+  use_count 与 weak_count 的含义：
+
+    control block 内有两个独立计数器，控制两件不同的事：
+
+    use_count（强引用计数）
+      = 当前拥有该对象的 shared_ptr 实例数量
+      shared_ptr 构造/拷贝 → use_count++
+      shared_ptr 析构/reset → use_count--
+      use_count 降为 0 → T 析构函数调用，T 对象销毁
+
+    weak_count（弱引用计数）
+      = 当前观察该对象的 weak_ptr 数量 + 1
+      （额外的 +1：只要 use_count > 0，weak_count 就多保留 1，
+        防止 control block 在所有 shared_ptr 消亡前被提前释放）
+      weak_ptr 构造 → weak_count++
+      weak_ptr 析构 → weak_count--
+      use_count 降为 0 时，额外的 +1 被移除（weak_count--）
+      weak_count 降为 0 → control block 自身释放
+
+    两个计数器控制两个独立的生命周期阶段：
+      阶段1：use_count = 0  →  T 对象被销毁
+      阶段2：weak_count = 0 →  control block 被销毁
+
+    计数变化示例：
+      shared_ptr<T> sp1(new T);   // use_count=1, weak_count=1（额外+1）
+      shared_ptr<T> sp2 = sp1;   // use_count=2, weak_count=1
+      weak_ptr<T>   wp  = sp1;   // use_count=2, weak_count=2
+
+      sp2.reset();               // use_count=1, weak_count=2
+      sp1.reset();               // use_count=0 → ~T() 调用，T 内存释放
+                                 // 额外+1被移除 → weak_count=1，control block 存活
+      wp.expired();              // true（use_count==0），wp 本身未析构
+      wp.reset();                // weak_count=0 → control block 释放
+
+    // shared_ptr<T>(new T)：两块独立内存，独立释放
+    //   use_count 降为 0 → T 对象析构 + 释放 T 的内存（第1块 free）
+    //   weak_count 也降为 0 → 释放 control block（第2块 free）
+    //   T 内存在 use_count=0 时立即归还，与 weak_ptr 是否存活无关
+
+    // make_shared<T>：一块连续内存，整体只能一次性释放
+    //   use_count 降为 0 → T 对象析构（调用 ~T()，但内存还没还给系统）
+    //   weak_count 也降为 0 → 整块内存才被释放（一次 free）
+    //   T 已析构但内存未释放，只要 weak_ptr 存活，T 所占字节仍被持有
+
+    // 结论：若 T 体积大且存在长生命周期的 weak_ptr，
+    //       make_shared 会导致 T 的内存在 weak_ptr 消亡之前无法归还给系统
+
+    示例：
+      struct Big { char data[1024 * 1024]; };   // 1 MB
+
+      std::weak_ptr<Big> wp;
+      {
+          auto sp = std::make_shared<Big>();     // 分配 ~1MB + control block（连续）
+          wp = sp;                               // use_count=1, weak_count=2
+      }   // sp 析构：use_count=0 → ~Big() 调用，额外+1移除 → weak_count=1
+          // 1MB 内存未释放（与 control block 同在一块，weak_count 仍为 1）
+
+      // wp 离开作用域：weak_count=0 → 整块内存（1MB + control block）一次性释放
+
+      // 若用 shared_ptr<Big>(new Big)：
+      {
+          auto sp = std::shared_ptr<Big>(new Big());
+          wp = sp;                               // use_count=1, weak_count=2
+      }   // sp 析构：use_count=0 → ~Big() 调用，1MB 内存立即归还系统
+          // 额外+1移除 → weak_count=1，control block（几十字节）继续存活
+
+      // wp 离开作用域：weak_count=0 → control block 释放
+
+④ 自定义删除器
+
+    // shared_ptr 构造函数可以接受自定义删除器：
+    auto sp = std::shared_ptr<TensorImpl>(raw, [](TensorImpl* p) {
+        p->~TensorImpl();      // 手动析构
+        my_allocator.free(p);  // 自定义内存释放
+    });
+
+    // make_shared 不接受自定义删除器（内存由 make_shared 内部统一管理）
+    auto sp = std::make_shared<TensorImpl>(...);  // 只能用 delete
+
+⑤ 对象构造方式
+
+    // shared_ptr(new T)：在调用点显式 new，构造参数直接传给 new
+    auto sp = std::shared_ptr<T>(new T(arg1, arg2));
+
+    // make_shared<T>：内部转发参数，等价于 new(addr) T(arg1, arg2)（定位 new）
+    auto sp = std::make_shared<T>(arg1, arg2);
+
+    // 若 T 的构造函数是 private，make_shared 无法直接调用（需 friend 声明）
+    class T {
+        T() {}  // private 构造函数
+        friend class std::shared_ptr<T>;  // 只对 shared_ptr 有效
+        // make_shared 内部用 allocator 调用构造，friend 声明更复杂
+    };
+
+汇总对比：
+
+  | 维度                 | shared_ptr<T>(new T)      | make_shared<T>()               |
+  |----------------------|---------------------------|--------------------------------|
+  | 堆分配次数           | 2次                       | 1次                            |
+  | 内存布局             | T 和 control block 不相邻 | T 和 control block 连续相邻    |
+  | 缓存局部性           | 较差                      | 较好                           |
+  | 异常安全             | 在函数参数中有风险        | 安全                           |
+  | T 内存释放时机       | use_count=0 立即释放      | 需等 weak_count 也为 0 才释放  |
+  | 自定义删除器         | 支持                      | 不支持                         |
+  | private 构造函数     | 需 friend shared_ptr      | 需更复杂的 friend 声明         |
+  | 推荐使用场景         | 需自定义删除器或分配器    | 通常情况下首选                 |
+
+── unique_ptr<T> ─────────────────────────────────────────────────────────────────
+
+  // Deleter 默认为 std::default_delete<T>，等价于 delete ptr
+  // EBO（空基类优化）：若 Deleter 是无状态的空类，sizeof(unique_ptr) == sizeof(T*)
+  template <typename T, typename Deleter = std::default_delete<T>>
+  class unique_ptr {
+      T*      ptr_;   // 唯一成员（Deleter 通常通过 EBO 零开销内嵌）
+      Deleter del_;
+
+  public:
+      unique_ptr() noexcept : ptr_(nullptr) {}
+      explicit unique_ptr(T* ptr) noexcept : ptr_(ptr) {}
+
+      // 禁止拷贝：独占所有权，不允许共享
+      unique_ptr(const unique_ptr&)            = delete;
+      unique_ptr& operator=(const unique_ptr&) = delete;
+
+      // 移动构造：转移所有权
+      unique_ptr(unique_ptr&& o) noexcept : ptr_(o.ptr_), del_(std::move(o.del_)) {
+          o.ptr_ = nullptr;
+      }
+
+      // 移动赋值
+      unique_ptr& operator=(unique_ptr&& o) noexcept {
+          if (ptr_ != o.ptr_) {
+              reset();
+              ptr_ = o.ptr_;
+              del_ = std::move(o.del_);
+              o.ptr_ = nullptr;
+          }
+          return *this;
+      }
+
+      ~unique_ptr() { reset(); }
+
+      T* get()        const noexcept { return ptr_; }
+      T& operator*()  const noexcept { return *ptr_; }
+      T* operator->() const noexcept { return ptr_; }
+      explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+      // release：放弃所有权，返回裸指针，调用者负责后续释放
+      T* release() noexcept {
+          T* p = ptr_;
+          ptr_ = nullptr;
+          return p;
+      }
+
+      // reset：销毁当前持有对象，接管新指针（默认接管 nullptr）
+      void reset(T* p = nullptr) noexcept {
+          if (ptr_) del_(ptr_);   // 调用 deleter（默认 delete ptr_）
+          ptr_ = p;
+      }
+  };
+
+── 三者关键设计对比 ──────────────────────────────────────────────────────────────
+
+  | 实现细节           | unique_ptr          | shared_ptr              | weak_ptr              |
+  |--------------------|---------------------|-------------------------|-----------------------|
+  | 成员               | ptr_ + del_（EBO）  | ptr_ + ctrl_            | ptr_ + ctrl_          |
+  | sizeof（64位）     | 8 bytes             | 16 bytes                | 16 bytes              |
+  | control block      | 无                  | 有（持有）              | 有（共享，不拥有）    |
+  | 拷贝               | 禁止（=delete）     | 允许（use_count++）     | 允许（weak_count++）  |
+  | 移动               | 转移 ptr_，置 null  | 转移 ptr_+ctrl_，置null | 转移 ptr_+ctrl_，置null|
+  | 析构               | del_(ptr_)          | release_()（见上）      | release_()（见上）    |
+  | 访问对象           | 直接 * / ->         | 直接 * / ->             | 须先 lock()           |
+  | 线程安全           | 不适用（独占）      | use_count 操作原子      | lock() 原子 CAS       |
+
+
+【9.3 实现中涉及的 C++ 语法详解】
+
+① virtual / = 0 / = delete 的区别
+
+    virtual void f();          // 虚函数：派生类可以覆写，调用时动态派发
+    virtual void f() = 0;      // 纯虚函数：本类不提供实现，派生类必须覆写
+                               //   含纯虚函数的类 = 抽象类，不能直接实例化
+    void f() = delete;         // 删除函数：显式禁止调用，调用则编译报错
+
+    // 抽象类不能实例化：
+    ControlBlock cb;           // 编译错误：ControlBlock 含纯虚函数
+    CtrlBlockPtr<T> cb2;       // OK：CtrlBlockPtr 覆写了所有纯虚函数
+
+② 虚函数与 vtable（虚函数表）
+
+    每个含虚函数的类，编译器为其生成一张 vtable（函数指针数组）。
+    每个对象头部隐含一个 vptr（指向所属类的 vtable）。
+
+    ControlBlock 对象布局（概念上）：
+      ┌──────────────────────────────────────────────────────┐
+      │ vptr ──▶ ControlBlock::vtable                       │
+      │           [ &ControlBlock::destroy    = nullptr ]   │  ← 纯虚，无实现
+      │           [ &ControlBlock::deallocate = nullptr ]   │
+      │ use_count                                            │
+      │ weak_count                                           │
+      └──────────────────────────────────────────────────────┘
+
+    CtrlBlockPtr<T> 对象布局（实际 ctrl_ 指向的）：
+      ┌──────────────────────────────────────────────────────┐
+      │ vptr ──▶ CtrlBlockPtr<T>::vtable                    │
+      │           [ &CtrlBlockPtr<T>::destroy    ]           │  ← 有实现
+      │           [ &CtrlBlockPtr<T>::deallocate ]           │
+      │ use_count                                            │
+      │ weak_count                                           │
+      │ ptr_（T*）                                           │
+      └──────────────────────────────────────────────────────┘
+
+    ctrl_->destroy() 的执行路径：
+      ctrl_ 静态类型：ControlBlock*（基类指针）
+      ctrl_ 动态类型：CtrlBlockPtr<T>*（运行时实际类型）
+      → 读取 ctrl_ 对象头部的 vptr
+      → 查 CtrlBlockPtr<T>::vtable，找到 destroy 的地址
+      → 跳转执行 CtrlBlockPtr<T>::destroy()，即 delete ptr_
+      ControlBlock::destroy()（纯虚，无实现）从未被调用
+
+③ const 成员函数（后置 const）
+
+    T* get() const noexcept { return ptr_; }
+    //         ↑
+    //  后置 const：修饰 this，不修饰返回值
+
+    普通成员函数：this 类型是 shared_ptr<T>*
+                  可以读写所有成员（ptr_、ctrl_）
+
+    const 成员函数：this 类型是 const shared_ptr<T>*
+                   所有非 mutable 成员变为只读，不可重赋值
+                   ptr_ 等价于访问类型 T* const（指针本身不可改，但可读取其值返回）
+
+    // 只有 const 成员函数才能在 const 对象上调用：
+    const shared_ptr<T> sp = make_shared<T>();
+    sp.get();     // OK：get() 是 const 成员函数
+    sp.reset();   // 编译错误：reset() 不是 const 成员函数
+
+    mutable 关键字：突破 const 限制
+      mutable int access_count_ = 0;
+      int get() const { access_count_++; return val_; }
+      // access_count_ 是 mutable，即使在 const 函数内也可修改
+
+④ this->ptr_ 与 (*this).ptr_ 完全等价
+
+    -> 的定义就是"解引用指针再访问成员"，对任何指针都成立：
+      this->ptr_    ≡    (*this).ptr_
+      p->member     ≡    (*p).member
+
+⑤ operator-> 为何返回 ptr_ 而非 *ptr_
+
+    展开规则：编译器看到 sp->x 时，递归展开直到左边是原始指针为止：
+
+      sp->x
+        ↓ sp 不是原始指针，查找 operator->，调用它
+      sp.operator->()->x
+        ↓ 返回 ptr_（原始指针 T*），对原始指针应用 ->x（即标准成员访问）
+      (*ptr_).x                       ← 最终等价形式
+
+    x 是编译期固定的成员名（标识符），不是可求值的表达式，不能作为参数：
+
+      sp->x   → sp.operator->()->x   // ✓ x 是成员名，附加在返回的指针上
+      sp[i]   → sp.operator[](i)     // ✓ i 是表达式，可以作为参数传入
+      // sp.operator->(x) 是错误理解：x 不是参数，是访问返回值的成员名
+
+    因此 operator-> 不接受任何参数（只有隐含的 this），必须返回指针：
+
+      T* operator->() const noexcept { return ptr_; }   // ✓ 返回指针，编译器续接 ->
+      T& operator->() const noexcept { return *ptr_; }  // ✗ 返回引用，无法续接 ->
+
+    对比 operator*（解引用，返回对象引用）：
+      T& operator*() const noexcept { return *ptr_; }   // ✓ 解引用，返回 T&
+
+      *sp     → sp.operator*()       → *ptr_            → T&（对象本身）
+      sp->x   → sp.operator->()->x  → (*ptr_).x        → T 的成员 x
+
+    原始指针的 p->x 不走 operator-> 机制，是编译器内置操作：
+
+      p->x
+        ↓ p 是原始指针，内置规则直接展开，无函数调用
+      (*p).x
+        ↓ 编译器知道 x 在类型中的偏移量（编译期常量）
+      *(p + offsetof(T, x))          ← 最终机器码等价形式
+
+      struct Foo { int a; int b; };  // a 偏移 0，b 偏移 4
+      Foo* p = new Foo();
+      p->b;
+      // 编译器生成：读取地址 (p + 4) 处的 4 字节，无任何函数调用
+
+    -> 展开的完整规则：
+
+      expr->x
+        ├─ expr 是原始指针 → 内置：(*expr).x，直接计算偏移，无函数调用
+        └─ expr 是类对象  → 查找 operator->()，递归展开，直到得到原始指针
+
+    智能指针 sp->x 比原始指针 p->x 多一次 operator->() 的函数调用，
+    但该函数体只有 return ptr_ 一行，通常被编译器内联，实际机器码与原始指针相同。
+
+⑥ 成员函数指针
+
+    普通函数指针：返回类型 (*变量名)(参数列表)
+    成员函数指针：返回类型 (类名::*变量名)(参数列表) 限定符
+
+    T* (shared_ptr<T>::*fp)() const noexcept = &shared_ptr<T>::get;
+
+    调用方式（必须加括号，.*  优先级低于 ()）：
+      shared_ptr<T>  sp;   (sp.*fp)()    // 通过对象调用
+      shared_ptr<T>* p;    (p->*fp)()    // 通过指针调用
+
+    | 持有方式 | 普通成员访问  | 成员函数指针调用 |
+    |---------|-------------|----------------|
+    | 对象 obj | obj.member   | (obj.*fp)()    |
+    | 指针 ptr | ptr->member  | (ptr->*fp)()   |
+
+
+
+
+--------------------------------------------------------------------------------
+十、explicit 详解与示例
+--------------------------------------------------------------------------------
+
+【10.1 explicit】
+
+阻止隐式类型转换，只允许显式构造：
+
+  void foo(intrusive_ptr<TensorImpl> p) { ... }
+  TensorImpl* raw = new TensorImpl(...);
+
+  // 没有 explicit：
+  foo(raw);   // 隐式构造 intrusive_ptr，retain_() 被悄悄调用，调用者感知不到所有权转移
+
+  // 有 explicit：
+  foo(raw);                            // 编译错误，必须显式写出
+  foo(intrusive_ptr<TensorImpl>(raw)); // OK，意图清晰
+
+裸指针转 intrusive_ptr 意味着接管所有权，必须显式表达，防止意外的所有权转移。
+
+【10.2 两种初始化语法的区别】
+
+  C++ 中"初始化"有两种根本不同的语法：
+
+  ┌─────────────────────┬──────────────────────────────────────────────────────┐
+  │ 写法                │ 名称          │ 是否允许 explicit 构造函数            │
+  ├─────────────────────┼───────────────┼───────────────────────────────────────┤
+  │ T obj = value;      │ 拷贝初始化    │ 不允许（会被排除在候选集之外）        │
+  │ T obj(value);       │ 直接初始化    │ 允许                                  │
+  │ T obj{value};       │ 列表初始化    │ 允许（部分场景不允许窄化转换）        │
+  │ foo(value)          │ 函数实参传递  │ 不允许（隐式转换路径）                │
+  │ return value;       │ 返回值        │ 不允许（隐式转换路径）                │
+  └─────────────────────┴───────────────┴───────────────────────────────────────┘
+
+  "隐式"的含义：程序员没有明确写出构造过程，由编译器自动推断并调用。
+  拷贝初始化（= 语法）、函数传参、return 语句均属于隐式路径，
+  因此 explicit 构造函数在这些场合被排除。
+
+【10.3 不同类型之间的隐式转换（典型 explicit 场景）】
+
+  struct Wrapper {
+      explicit Wrapper(int x) { ... }   // 阻止 int → Wrapper 隐式转换
+  };
+
+  Wrapper a = 42;     // 错误：拷贝初始化，explicit 构造被排除
+  Wrapper b(42);      // OK：直接初始化，显式调用
+  Wrapper c{42};      // OK：列表初始化，显式调用
+
+  void foo(Wrapper w) { ... }
+  foo(42);            // 错误：函数实参隐式转换，explicit 构造被排除
+  foo(Wrapper(42));   // OK：显式构造后传入
+
+  用途：int 和 Wrapper 是不同类型，禁止隐式转换防止意外赋值。
+
+【10.4 相同类型之间的 explicit 拷贝构造】
+
+  class ExplicitCopy {
+  public:
+      explicit ExplicitCopy(const ExplicitCopy& other) { ... }
+  };
+
+  ExplicitCopy a;
+  ExplicitCopy b = a;   // 错误：拷贝初始化，explicit 构造被排除
+  ExplicitCopy c(a);    // OK：直接初始化，显式调用拷贝构造
+
+  关键澄清：
+    `ExplicitCopy b = a;` 中 a 和 b 是同一类型，
+    编译器不会构造任何临时对象（类型匹配，直接查找拷贝构造函数），
+    但因为拷贝构造标了 explicit，它被排除在拷贝初始化的候选集之外，
+    → 编译器找不到可用的构造函数，报错。
+
+    错误本质：explicit 将该构造函数从隐式路径中剔除，
+    而非"需要临时对象"或"类型不同"。
+
+【10.5 在 intrusive_ptr 中的应用】
+
+  explicit intrusive_ptr(T* ptr) noexcept : ptr_(ptr) {
+      if (ptr_) ptr_->retain_();
+  }
+
+  TensorImpl* raw = new TensorImpl(...);
+
+  // 隐式路径（被阻止）：
+  intrusive_ptr<TensorImpl> p = raw;      // 错误：= 语法，explicit 排除
+  void foo(intrusive_ptr<TensorImpl> p);
+  foo(raw);                               // 错误：函数传参隐式转换，explicit 排除
+
+  // 显式路径（允许）：
+  intrusive_ptr<TensorImpl> p(raw);       // OK
+  foo(intrusive_ptr<TensorImpl>(raw));    // OK
+
+  原因：裸指针 → intrusive_ptr 意味着接管所有权并调用 retain_()，
+  必须由程序员显式表达，不能让编译器静默代劳。
+
+
+--------------------------------------------------------------------------------
+十一、noexcept 详解与示例
+--------------------------------------------------------------------------------
+
+【11.1 noexcept】
+
+标记函数保证不抛出异常，三个作用：
+
+① 编译器优化：无需生成异常处理代码（栈展开表），生成代码更小更快。
+
+② 容器移动语义：std::vector 扩容时，只有移动构造标记了 noexcept 才会用移动代替拷贝。
+   若不标记，vector 为保证异常安全会退回拷贝构造：
+
+   // 移动构造没有 noexcept：
+   v.push_back(...);  // 扩容时退回拷贝构造，refcount++ 次数翻倍
+
+   // 移动构造有 noexcept：
+   v.push_back(...);  // 扩容时使用移动构造，O(1) 无额外 refcount 操作
+
+③ 违反时的后果：若 noexcept 函数内抛出异常，直接调用 std::terminate() 终止程序，
+   不会向上传播。
+
+
+【11.2 语法形式】
+
+  void f() noexcept;              // 无条件不抛异常
+  void g() noexcept(true);        // 同上（条件版，条件为 true）
+  void h() noexcept(false);       // 等同于普通函数，可能抛异常
+  template<typename T>
+  void move_it(T& t) noexcept(std::is_nothrow_move_constructible_v<T>);
+  //                           ↑ 条件版：当 T 的移动构造不抛异常时，本函数也不抛异常
+
+【11.2.1 条件 noexcept 详解：move_it 的完整拆解】
+
+① noexcept(expr) 的语义
+
+  noexcept(expr) 接受一个编译期常量布尔表达式：
+    expr 为 true  → 函数承诺不抛异常（等同于 noexcept）
+    expr 为 false → 函数可能抛异常（等同于没有 noexcept）
+
+  expr 在编译期求值，不产生任何运行时开销。
+
+② std::is_nothrow_move_constructible_v<T>
+
+  这是一个类型特征（type trait），完整展开：
+
+    std::is_nothrow_move_constructible_v<T>
+      等价于
+    std::is_nothrow_move_constructible<T>::value
+
+  含义：T 的移动构造函数存在且标记了 noexcept。
+  编译器在编译期检查 T 的移动构造签名，返回 true 或 false。
+
+  示例：
+    std::is_nothrow_move_constructible_v<int>                    → true
+    std::is_nothrow_move_constructible_v<intrusive_ptr<T>>       → true（标了 noexcept）
+    std::is_nothrow_move_constructible_v<std::list<int>>         → true
+    std::is_nothrow_move_constructible_v<WithoutNoexcept>        → false（移动构造无 noexcept）
+
+③ 整行的完整含义
+
+  template<typename T>
+  void move_it(T& t) noexcept(std::is_nothrow_move_constructible_v<T>);
+
+  逐段读法：
+    template<typename T>         → T 是模板参数，调用时由实参推导
+    void move_it(T& t)           → 接受 T 的左值引用（函数体内通常 std::move(t) 触发移动）
+    noexcept(...)                → 条件 noexcept，括号内是编译期 bool
+    std::is_nothrow_move_constructible_v<T>
+                                 → 当且仅当 T 的移动构造不抛异常时，本函数也不抛异常
+
+  效果：
+    move_it(intrusive_ptr<TensorImpl>{})  → T 移动构造有 noexcept → move_it 也是 noexcept
+    move_it(WithoutNoexcept{})            → T 移动构造无 noexcept → move_it 也不承诺 noexcept
+
+④ 为什么要随 T 变化，而不直接写死 noexcept？
+
+  move_it 是泛型函数，函数体内部会调用 T 的移动构造。
+  若 T 的移动构造可能抛异常，则 move_it 也可能抛异常，写死 noexcept 会撒谎：
+
+    template<typename T>
+    void move_it(T& t) noexcept {          // ← 写死：不管 T 是什么都承诺不抛
+        T tmp(std::move(t));               // T 的移动构造若抛异常 → std::terminate()
+    }
+
+  条件版正确地将"是否 noexcept"的决定权下放给 T：
+
+    template<typename T>
+    void move_it(T& t) noexcept(std::is_nothrow_move_constructible_v<T>) {
+        T tmp(std::move(t));               // T 抛 → 函数也被允许抛，不触发 terminate
+    }
+
+⑤ noexcept 操作符（与说明符的区别）
+
+  noexcept 有两种用法，拼写相同但角色不同：
+
+    // 说明符（specifier）：标注函数，放在参数列表之后
+    void f() noexcept;
+    void g() noexcept(expr);
+
+    // 操作符（operator）：查询表达式是否 noexcept，返回 bool，不执行表达式
+    bool b = noexcept(std::move(t));   // 查询 std::move(t) 这个表达式是否 noexcept
+
+  两者结合的惯用写法（noexcept-noexcept 模式）：
+
+    template<typename T>
+    void move_it(T& t) noexcept(noexcept(T(std::move(t)))) {
+    //           ↑说明符            ↑操作符：查询 T 的移动构造是否 noexcept
+        T tmp(std::move(t));
+    }
+
+  与 is_nothrow_move_constructible_v 的等价关系：
+    noexcept(T(std::move(t)))
+      ≡ std::is_nothrow_move_constructible_v<T>
+  两者效果相同，后者更具可读性，前者更通用（可查询任意表达式）。
+
+【11.3 作用一：vector 扩容时的移动 vs 拷贝】
+
+  扩容时 std::vector 需要把旧元素搬到新内存。
+  为保证强异常安全（要么全成功要么无副作用），它要求搬运过程不能抛异常。
+  检查方式：std::is_nothrow_move_constructible<T>（即移动构造是否标了 noexcept）。
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ 无 noexcept 版本（退回拷贝构造）                                            │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  struct WithoutNoexcept {
+      intrusive_ptr<TensorImpl> impl_;
+
+      WithoutNoexcept(WithoutNoexcept&& other)   // ← 没有 noexcept
+          : impl_(std::move(other.impl_)) {}
+  };
+
+  std::vector<WithoutNoexcept> v;
+  v.reserve(2);
+  v.emplace_back(...);   // refcount = 1
+  v.emplace_back(...);   // 触发扩容
+
+  // 扩容时：vector 看到移动构造没有 noexcept，改用拷贝构造
+  //   拷贝构造 → intrusive_ptr 拷贝构造 → retain_()  → refcount: 1 → 2
+  //   旧内存释放 → intrusive_ptr 析构    → release_() → refcount: 2 → 1
+  // 结果：refcount 最终正确，但多了一对 retain/release 原子操作
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ 有 noexcept 版本（直接移动）                                                │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  struct WithNoexcept {
+      intrusive_ptr<TensorImpl> impl_;
+
+      WithNoexcept(WithNoexcept&& other) noexcept   // ← 有 noexcept
+          : impl_(std::move(other.impl_)) {}
+  };
+
+  std::vector<WithNoexcept> v;
+  v.reserve(2);
+  v.emplace_back(...);   // refcount = 1
+  v.emplace_back(...);   // 触发扩容
+
+  // 扩容时：vector 看到移动构造有 noexcept，直接使用移动构造
+  //   移动构造 → intrusive_ptr 移动构造 → ptr_ 转移，other.ptr_ = nullptr
+  //   refcount 不变，无原子操作
+  // 结果：refcount 正确，且节省一对原子 fetch_add/fetch_sub
+
+【11.4 作用二：违反 noexcept 时的 terminate】
+
+  void risky() noexcept {
+      throw std::runtime_error("oops");   // 违反承诺
+  }
+
+  int main() {
+      try {
+          risky();           // 调用标记了 noexcept 的函数
+      } catch (...) {
+          // 永远不会执行到这里
+      }
+      // 程序在 risky() 抛出时直接调用 std::terminate()
+      // terminate 默认调用 abort()，生成 core dump，不打印 catch 块内容
+  }
+
+  对比普通函数（无 noexcept）：
+    → 异常沿调用栈向上传播，可被 catch 捕获，程序继续运行
+
+【11.5 作用三：编译器优化（生成代码更小）】
+
+  noexcept 函数不需要生成异常处理元数据（stack unwinding table），
+  通常可减小生成的二进制体积，在频繁调用的路径上有微小性能收益。
+
+【11.6 汇总表】
+
+  | 场景                         | 无 noexcept              | 有 noexcept                        |
+  |------------------------------|--------------------------|------------------------------------|
+  | vector 扩容搬运元素          | 退回拷贝构造（多原子op） | 使用移动构造（无额外原子op）       |
+  | 函数内抛出异常               | 正常向上传播             | 直接 std::terminate()，core dump   |
+  | 生成的二进制                 | 含 unwind 元数据         | 无 unwind 元数据，体积略小         |
+  | intrusive_ptr 特殊成员标注   | 无要求（但不推荐省略）   | 全部标注 noexcept，PyTorch 实践    |
+
+
+--------------------------------------------------------------------------------
+十二、friend 关键字
+--------------------------------------------------------------------------------
+【12.1 friend 关键字】
+
+friend 声明打破类的访问控制，让指定的外部类或函数能访问本类的 private/protected 成员。
+
+  class intrusive_ptr_target {
+  private:
+      std::atomic<uint32_t> refcount_{0};   // private
+      void retain_() const noexcept { ... } // private
+      void release_() const noexcept { ... }// private
+
+      template <typename T>
+      friend class intrusive_ptr;           // intrusive_ptr<T> 可访问上面所有 private 成员
+  };
+
+没有这行声明，intrusive_ptr 调用 ptr_->retain_() 会编译报错：
+  error: 'void intrusive_ptr_target::retain_() const' is private
+
+friend 的特性：
+  ① 单向性：A 授权给 B，不意味着 B 也授权给 A
+  ② 不可继承：子类不继承父类的 friend 关系
+  ③ 模板 friend：template <typename T> friend class intrusive_ptr
+       授权所有实例化（intrusive_ptr<TensorImpl>、intrusive_ptr<StorageImpl> 等）
+
+为什么不把 retain_/release_ 设为 public：
+  设为 public 后，外部代码可随意调用，破坏引用计数：
+    p->retain_();  // 手动增加，永远不会释放 → 内存泄漏
+    p->release_(); // 手动减少，提前 delete  → 悬空指针
+  设为 private + friend，将合法调用路径收窄到 intrusive_ptr，
+  外部只能通过句柄间接操作引用计数，无法绕过。
+
+访问控制汇总：
+  | 访问控制    | 本类内部 | 子类 | 外部 | friend |
+  |-------------|----------|------|------|--------|
+  | public      |    ✓     |  ✓  |  ✓  |   ✓   |
+  | protected   |    ✓     |  ✓  |  ✗  |   ✓   |
+  | private     |    ✓     |  ✗  |  ✗  |   ✓   |
+
+【12.2 如何保证 T 继承自 intrusive_ptr_target】
+
+第一层（编译错误）：retain_()/release_() 是 intrusive_ptr_target 的 private 方法，
+  T 若不继承，调用 ptr_->retain_() 编译报错：
+    'Foo' has no member named 'retain_'
+
+第二层（主动静态断言）：
+  template <typename T>
+  class intrusive_ptr {
+      static_assert(
+          std::is_base_of<intrusive_ptr_target, T>::value,
+          "T must inherit from intrusive_ptr_target"
+      );
+      // C++20 等价写法：
+      // requires std::derived_from<T, intrusive_ptr_target>
+  };
+
+--------------------------------------------------------------------------------
+十三、左值引用与右值引用
+--------------------------------------------------------------------------------
+
+【13.1 左值与右值：基础概念】
+
+C++ 中每个表达式都有两个独立属性：类型（type）和值类别（value category）。
+
+  左值（lvalue）：有名字、有稳定地址，表达式结束后仍然存在。
+  右值（rvalue）：没有名字或是临时对象，表达式结束后通常消亡。
+                  C++11 起细分为 prvalue（纯右值）和 xvalue（将亡值）。
+
+判断口诀：能取地址的是左值，不能取地址的是右值。
+
+  int a = 42;
+  int* p1 = &a;         // OK：a 是左值，可取地址
+  int* p2 = &42;        // 错误：42 是右值（prvalue），不能取地址
+  int* p3 = &(a + 1);   // 错误：a+1 是右值（prvalue），不能取地址
+
+  std::string s = "hello";
+  std::string* p4 = &std::string("tmp");  // 错误：临时对象是右值
+
+常见左值：变量名、数组元素、解引用 *ptr、函数返回左值引用
+常见右值：字面量（42, 3.14, true）、临时对象、函数返回非引用值、std::move() 的结果
+
+【13.2 左值引用（&）】
+
+左值引用只能绑定到左值（有名字、有地址的对象）。
+
+  int a = 10;
+  int& ref = a;          // OK：a 是左值
+  ref = 20;              // 修改 a，a 变为 20
+  int& bad = 42;         // 错误：42 是右值，不能绑定到非 const 左值引用
+
+  // const 左值引用是例外：可绑定到右值（延长临时对象生命周期）
+  const int& cref = 42;  // OK：cref 绑定到临时 int(42)，生命周期延长至 cref 离开作用域
+  const int& cref2 = a;  // OK：也可绑定左值
+
+函数参数中的左值引用：
+
+  void increment(int& x) { x++; }   // x 是左值引用，修改传入的实参
+
+  int n = 5;
+  increment(n);    // OK：n 是左值，n 变为 6
+  increment(42);   // 错误：42 是右值，不能绑定到 int&
+
+用途：
+  ① 避免拷贝，允许函数修改实参（out 参数）
+  ② const T& 参数：避免拷贝，不修改实参，可同时接受左值和右值
+
+【13.3 右值引用（&&）】
+
+右值引用只能绑定到右值（临时对象或 std::move() 的结果）。
+
+  int&& rref = 42;                  // OK：42 是右值
+  int&& rref2 = std::move(n);       // OK：std::move 把左值转换为右值引用
+  int&& bad   = n;                  // 错误：n 是左值，不能直接绑定到 &&
+
+  重要：右值引用变量本身是左值（有名字、有地址）。
+  int&& r = 42;
+  int* p = &r;   // OK：r 有地址，r 本身是左值
+  //              ← 这就是移动构造函数内可以对 other.ptr_ 赋值的原因
+
+函数参数中的右值引用：
+
+  void take(int&& x) { ... }   // 只接受右值
+
+  take(42);             // OK：字面量是右值
+  take(std::move(n));   // OK：std::move(n) 产生右值引用
+  take(n);              // 错误：n 是左值，不绑定到 &&
+
+【13.4 三种引用的绑定规则汇总】
+
+  | 引用类型      | 可绑定左值 | 可绑定右值 | 可修改对象 |
+  |---------------|-----------|-----------|-----------|
+  | T&            |    ✓      |    ✗      |    ✓      |
+  | const T&      |    ✓      |    ✓      |    ✗      |
+  | T&&           |    ✗      |    ✓      |    ✓      |
+  | const T&&     |    ✗      |    ✓      |    ✗      |（极少使用）
+
+  const T& 是"万能只读引用"：接受一切，但不能修改。
+  T&& 是"右值专用引用"：转移所有权时使用。
+
+【13.5 std::move — 将左值强制转换为右值引用】
+
+  std::move 不移动任何东西，只做类型转换（static_cast<T&&>）。
+  它的作用是"告诉编译器：我不再需要这个对象，可以从它移动"。
+
+  实现：
+    template<typename T>
+    typename std::remove_reference<T>::type&& move(T&& t) noexcept {
+        return static_cast<typename std::remove_reference<T>::type&&>(t);
+    }
+
+  ── 逐元素拆解 ──────────────────────────────────────────────────────────────────
+
+  ① T&& t 是万能引用（forwarding reference），不是右值引用
+
+      条件：T 是待推导的模板参数，且形式恰好是 T&&（不能有 const、不能是 vector<T>&&）
+      → 此处满足，T&& 是万能引用，可同时绑定左值和右值。
+
+      万能引用的特殊推导规则（与普通模板参数不同）：
+
+        普通模板参数：template<typename T> void f(T t)
+          传入左值 string s → T 推导为 string（去掉引用，推导值类型）
+
+        万能引用：template<typename T> void f(T&& t)
+          传入左值 string s → T 推导为 string&（特殊：左值实参 → T 推导为左值引用类型）
+          传入右值 string{} → T 推导为 string （普通：右值实参 → T 推导为值类型）
+
+        为什么左值时 T 必须推导为 string& 而非 string？
+          若 T = string：T&& = string&&，右值引用无法绑定左值 s → 编译失败
+          若 T = string&：T&& = string& && → 引用折叠为 string& → 可绑定左值 s ✓
+          标准强制此规则，正是为了让引用折叠得以工作。
+
+      调用 std::move(s)，s 是左值（string 类型）：
+        T 推导为 string&        （万能引用特殊规则：左值 → T 推导为左值引用类型）
+        T&&  = string& &&  = string&    （引用折叠：& && → &）
+        参数 t 的类型是 string&，绑定到 s
+
+      调用 std::move(string("tmp"))，实参是右值（临时对象）：
+        T 推导为 string          （右值 → T 推导为值类型，无引用）
+        T&&  = string&&          （无折叠）
+        参数 t 的类型是 string&&，绑定到临时对象
+
+      两种调用 t 的类型不同，但函数体内 t 本身始终是左值（有名字）。
+
+  ② 为什么要加 typename
+
+      std::remove_reference<T>::type 是"依赖名称"（dependent name）：
+      它依赖模板参数 T，编译器在解析模板定义时无法确定 ::type 是类型还是静态变量。
+
+      C++ 规则：对于依赖名称，编译器默认假设它是值（变量/函数），
+      若实际是类型，必须用 typename 显式声明。
+
+      // 没有 typename：
+      std::remove_reference<T>::type&& move(...);   // 编译错误
+      // 编译器把 ::type 解析为静态成员变量，后面接 && 语法不合法
+
+      // 有 typename：
+      typename std::remove_reference<T>::type&& move(...);  // OK
+      // typename 告诉编译器：::type 是一个类型名，可以接 && 构成引用类型
+
+  ③ std::remove_reference<T>::type 的作用
+
+      remove_reference 是一个类型特征模板，去掉类型上的引用修饰：
+
+        remove_reference<int>    ::type  →  int
+        remove_reference<int&>   ::type  →  int
+        remove_reference<int&&>  ::type  →  int
+
+      为什么要剥掉引用再加 &&？
+
+      以左值调用为例：T 推导为 string&
+        不剥引用直接写 T&&：string& && → 折叠为 string&   ← 返回左值引用，错误
+        剥掉引用后写  T&&：string  && → string&&           ← 正确的右值引用
+
+      无论 T 推导为 string、string& 还是 string&&，
+      remove_reference 先还原为 string，再加 && 得到 string&&，
+      确保返回类型始终是右值引用。
+
+  ④ static_cast<typename std::remove_reference<T>::type&&>(t) 的作用
+
+      函数体内 t 是具名参数，不管其类型是 string& 还是 string&&，
+      t 本身是左值（有名字 → 有地址）。
+
+      必须显式 cast 才能把左值 t 转为右值引用并返回：
+        static_cast<string&&>(t)   →  产生 string&&（右值引用），触发移动构造
+
+      不 cast 直接 return t：返回左值，调用方触发拷贝构造而非移动构造。
+
+  ── 完整推导示例 ─────────────────────────────────────────────────────────────────
+
+    std::string s = "hello";
+    std::move(s);
+
+    步骤：
+      ① 实参 s 是左值 → T 推导为 string&（万能引用特殊规则，非普通推导的 string）
+      ② 参数类型：T&& = string& && = string&（引用折叠：& && → &）
+      ③ 返回类型：remove_reference<string&>::type = string → string&&
+      ④ 函数体：static_cast<string&&>(t) → t 被强制转换为右值引用
+      ⑤ 返回 string&&，调用方的移动构造/移动赋值看到右值引用，触发移动语义
+
+    std::move(string("tmp"));
+
+    步骤：
+      ① 实参是右值 → T 推导为 string（无引用）
+      ② 参数类型：T&& = string&&
+      ③ 返回类型：remove_reference<string>::type = string → string&&
+      ④ 函数体：static_cast<string&&>(t) → 同上
+      ⑤ 返回 string&&，结果相同
+
+    两种调用路径不同，但结果一致：始终返回 string&&。
+
+  效果：
+    std::string s = "hello";
+    std::string s2 = std::move(s);   // s 变为空字符串，s2 获得原 s 的内容
+    // s 仍然存在（左值），但处于"有效但未指定"状态（valid but unspecified state）
+
+  在 intrusive_ptr 中：
+    intrusive_ptr<TensorImpl> p1(raw);
+    intrusive_ptr<TensorImpl> p2 = std::move(p1);
+    //   ① std::move(p1) 将 p1 转换为右值引用，触发移动构造
+    //   ② 移动构造：p2.ptr_ = p1.ptr_，p1.ptr_ = nullptr，refcount 不变
+    //   ③ p1 析构时 ptr_ 为 nullptr，release_() 不执行
+
+【13.6 移动语义：为什么需要右值引用】
+
+没有右值引用时，函数返回大对象必须拷贝：
+
+  std::vector<int> make_vec() {
+      std::vector<int> v(1000000);
+      return v;    // C++03：必须调用拷贝构造，O(n) 内存分配+复制
+  }
+
+有了右值引用，编译器可以直接"移动"内部缓冲区：
+
+  std::vector<int> make_vec() {
+      std::vector<int> v(1000000);
+      return v;    // C++11+：触发移动构造（或 NRVO），O(1) 指针转移
+  }
+
+  vector 的移动构造：
+    vector(vector&& other) noexcept
+        : data_(other.data_),   // 接管缓冲区指针
+          size_(other.size_),
+          cap_(other.cap_) {
+        other.data_ = nullptr;  // 源置空
+        other.size_ = 0;
+        other.cap_  = 0;
+    }
+
+【13.7 在 intrusive_ptr 中的完整体现】
+
+  // 拷贝构造：参数是 const 左值引用，接受左值
+  intrusive_ptr(const intrusive_ptr& other) noexcept : ptr_(other.ptr_) {
+      if (ptr_) ptr_->retain_();   // 必须 retain，两者共享同一 TensorImpl
+  }
+
+  // 移动构造：参数是右值引用，接受右值（std::move 的结果）
+  intrusive_ptr(intrusive_ptr&& other) noexcept : ptr_(other.ptr_) {
+      other.ptr_ = nullptr;        // 转移所有权，不 retain
+  }
+
+  // 函数中的 other 是右值引用类型，但 other 本身是左值（有名字）：
+  //   ptr_(other.ptr_)  → 读取 other.ptr_ 的值（左值访问，完全合法）
+  //   other.ptr_ = nullptr → 修改 other（左值操作，合法）
+  //   不需要 std::move(other)，因为 ptr_ 是 T*（标量），赋值即复制地址
+
+重载决议：编译器根据实参的值类别选择构造函数：
+
+  intrusive_ptr<TensorImpl> a(raw);        // raw 是左值 → 拷贝构造（retain）
+  intrusive_ptr<TensorImpl> b = a;         // a 是左值 → 拷贝构造（retain）
+  intrusive_ptr<TensorImpl> c = std::move(a); // move(a) 是右值 → 移动构造（不 retain）
+
+【13.8 转发引用（万能引用）】
+
+形如 T&& 且 T 是待推导模板参数时，称为转发引用（forwarding reference），
+不是普通右值引用，可同时绑定左值和右值。
+
+  template<typename T>
+  void wrapper(T&& arg) {         // T&& 是转发引用，不是右值引用
+      foo(std::forward<T>(arg));  // 完美转发：保持 arg 原来的值类别
+  }
+
+  引用折叠规则（决定 T&& 展开为什么类型）：
+    T = int&   → T&& = int& &&  → 折叠为 int&  （左值引用）
+    T = int&&  → T&& = int&& && → 折叠为 int&&  （右值引用）
+    T = int    → T&& = int&&    → 右值引用
+
+  wrapper(n);            // T 推导为 int&，  arg 是 int&，  完美传给 foo 的左值重载
+  wrapper(42);           // T 推导为 int,    arg 是 int&&,  完美传给 foo 的右值重载
+  wrapper(std::move(n)); // T 推导为 int,    arg 是 int&&,  完美传给 foo 的右值重载
+
+  std::forward<T>(arg)：
+    T 是左值引用 → static_cast<T&>(arg)   → 保持左值
+    T 是非引用   → static_cast<T&&>(arg)  → 转为右值
+
+  与 std::move 的区别：
+    std::move：无条件转为右值引用
+    std::forward：有条件转发，保持原始值类别
+
+
+--------------------------------------------------------------------------------
+十四、虚函数及其作用
+--------------------------------------------------------------------------------
+
+
+① 什么是虚函数
+
+    在基类中用 virtual 声明的成员函数。通过基类指针或引用调用时，
+    运行时根据对象的实际类型决定调用哪个版本，而非编译期根据指针类型决定。
+
+    // 无 virtual：静态绑定（编译期决定）
+    struct Animal {
+        void speak() { /* 动物叫 */ }
+    };
+    struct Dog : Animal {
+        void speak() { /* 汪汪 */ }
+    };
+
+    Animal* a = new Dog();
+    a->speak();   // 调用 Animal::speak()，编译期已决定，Dog::speak() 被忽略
+
+    // 有 virtual：动态绑定（运行时决定）
+    struct Animal {
+        virtual void speak() { /* 动物叫 */ }
+    };
+    struct Dog : Animal {
+        void speak() override { /* 汪汪 */ }
+    };
+
+    Animal* a = new Dog();
+    a->speak();   // 运行时查 vtable → 调用 Dog::speak()
+
+② vtable 与 vptr 机制
+
+    编译器为每个含虚函数的类生成一张 vtable（函数指针数组）。
+    每个对象头部有一个隐含的 vptr 指向所属类的 vtable。
+
+    Animal 对象内存布局：         Dog 对象内存布局：
+    ┌──────────────────┐          ┌──────────────────┐
+    │ vptr ──▶ Animal  │          │ vptr ──▶ Dog     │
+    │          vtable  │          │          vtable  │
+    │  [speak]─▶Animal │          │  [speak]─▶Dog   │ ← 覆写后指向 Dog::speak
+    │  数据成员...     │          │  数据成员...     │
+    └──────────────────┘          └──────────────────┘
+
+    a->speak() 执行步骤（a 是 Animal*，指向 Dog 对象）：
+      1. 读取 a 所指对象头部的 vptr（运行时，不是编译期）
+      2. 通过 vptr 找到 Dog::vtable
+      3. 在 vtable 中找到 speak 槽位，取出函数地址
+      4. 跳转执行 Dog::speak()
+
+    开销：每次虚函数调用多一次间接寻址（读 vptr → 查 vtable → 跳转）。
+    空间：每个对象多一个 vptr（8 bytes），每个类有一张 vtable（静态存储）。
+
+③ 纯虚函数（= 0）与抽象类
+
+    virtual void f() = 0;   // 纯虚：本类无实现，子类必须覆写
+
+    含纯虚函数的类是抽象类，不能直接实例化，只能作为接口使用：
+
+    struct Shape {
+        virtual double area() = 0;
+        virtual void   draw() = 0;
+    };
+    // Shape s;               // 编译错误：抽象类不能实例化
+
+    struct Circle : Shape {
+        double r_;
+        double area() override { return 3.14 * r_ * r_; }
+        void   draw() override { /* 画圆 */ }
+    };
+    struct Square : Shape {
+        double side_;
+        double area() override { return side_ * side_; }
+        void   draw() override { /* 画方形 */ }
+    };
+
+    // 统一接口处理不同类型（多态核心价值）：
+    std::vector<Shape*> shapes = { new Circle(1.0), new Square(2.0) };
+    for (auto* s : shapes) {
+        std::cout << s->area();  // 运行时决定：Circle::area 还是 Square::area
+        s->draw();               // 运行时决定：Circle::draw 还是 Square::draw
+    }
+
+④ override 与 final
+
+    override：显式声明"覆写基类虚函数"，签名不匹配则编译报错：
+
+      struct Base { virtual void f(int x); };
+
+      struct Derived : Base {
+          void f(int x)    override {}  // OK：正确覆写
+          void f(double x) override {}  // 编译错误：Base 无 f(double)，无法覆写
+          void f(int x)             {}  // 合法但危险：静默隐藏，不是多态覆写
+      };
+
+    final：禁止进一步覆写（或禁止继承该类）：
+
+      struct A { virtual void f() final {} };
+      struct B : A { void f() override {} };  // 编译错误：f 是 final
+
+      struct C final {};
+      struct D : C {};                        // 编译错误：C 是 final
+
+⑤ 虚析构函数
+
+    通过基类指针 delete 派生类对象时，析构函数若非虚函数，
+    只调用基类析构，派生类资源不会被释放：
+
+    // 危险：非虚析构
+    struct Base  { ~Base()  { } };
+    struct Child : Base {
+        int* buf_ = new int[1024];
+        ~Child() { delete[] buf_; }   // 不会被调用！
+    };
+    Base* p = new Child();
+    delete p;   // 只调用 ~Base()，buf_ 泄漏
+
+    // 正确：虚析构
+    struct Base { virtual ~Base() {} };
+    delete p;   // 查 vtable → 先调用 ~Child()，再调用 ~Base()，正确释放
+
+    规则：只要类设计为被继承、或通过基类指针管理生命周期，
+          析构函数就应该是 virtual。
+
+    ControlBlock 中 virtual ~ControlBlock() = default 的原因：
+      ctrl_->deallocate() 最终执行 delete this。
+      此时 this 的静态类型是 ControlBlock*，动态类型是 CtrlBlockPtr<T>。
+      若析构非虚，只调用 ~ControlBlock()，~CtrlBlockPtr<T>() 不执行，
+      CtrlBlockPtr 内的 ptr_ 等成员资源泄漏。
+
+⑥ 在 ControlBlock 中的实际体现
+
+    struct ControlBlock {
+        virtual void destroy()    = 0;  // 纯虚：子类决定如何销毁 T
+        virtual void deallocate() = 0;  // 纯虚：子类决定如何释放自身内存
+        virtual ~ControlBlock()   = default;  // 虚析构：保证派生类正确析构
+    };
+
+    ControlBlock 不是模板，不知道 T 是什么类型，
+    通过纯虚函数将"如何销毁 T"的决策下放给持有 T* 的 CtrlBlockPtr<T>：
+
+      ctrl_->destroy();     // ControlBlock* → vptr → CtrlBlockPtr<T>::vtable
+                            //               → 执行 delete ptr_（释放 T 对象）
+      ctrl_->deallocate();  // ControlBlock* → vptr → CtrlBlockPtr<T>::vtable
+                            //               → 执行 delete this（释放 control block）
+
+⑦ 静态类型 vs 动态类型：Base* 能"看到"什么
+
+    Base* p = new Child();   // p 的静态类型：Base*，动态类型：Child*
+
+    两个指针指向同一地址，内存布局：
+
+      地址 0x1000（堆上完整的 Child 对象）：
+        ┌─────────────────────────────┐  偏移 0
+        │ vptr（→ Child::vtable）     │  8 bytes
+        ├─────────────────────────────┤  偏移 8
+        │ x_ = 1  （Base 的成员）     │  4 bytes
+        ├─────────────────────────────┤  偏移 12
+        │ y_ = 2  （Child 的成员）    │  4 bytes
+        └─────────────────────────────┘
+
+      Base*  p = 0x1000   ← 指向这里
+      Child* q = 0x1000   ← 同一地址
+
+    y_ 的字节真实存在于内存 0x100C，但编译器在编译期处理 p->y_ 时，
+    只查 Base 的成员布局表，找不到 y_，直接报错——不会去运行时探测地址。
+
+    静态类型决定编译期"地图"（成员偏移量表），动态类型决定运行时 vtable：
+
+      p->x_;    // Base 有 x_，偏移 8 → 生成 *(p+8)，OK
+      p->y_;    // Base 无 y_ → 编译错误，不管运行时实际有没有
+      p->nf();  // 非虚：编译期写死 → call Base::nf()（静态绑定）
+      p->vf();  // 虚函数：生成间接跳转 → 运行时读 vptr → Child::vf()
+
+      q->y_;    // Child 有 y_，偏移 12 → 生成 *(q+12)，OK
+      q->cf();  // Child 有 cf() → OK
+
+    非虚函数的调用地址在编译期写死，永远跟静态类型走；
+    虚函数通过 vptr 在运行时查 vtable，唯一能让 Base* 执行到 Child 实现的机制。
+
+    若确实需要通过 Base* 访问 Child 特有成员，用 dynamic_cast 在运行时验证：
+
+      Child* q = dynamic_cast<Child*>(p);
+      if (q) {          // 运行时检查是否真的指向 Child 对象
+          q->y_;        // OK
+          q->cf();      // OK
+      }
+      // 若 p 实际不指向 Child，返回 nullptr，if 不执行，安全
+
+    Base* p = new Child() 不是普通类型转换，是隐式向上转型（upcast）：
+      Child IS-A Base（公有继承），Child* → Base* 天然安全，对象本身不变。
+      对比对象切片（object slicing）：
+        Base b = child_obj;  // 切片：只拷贝 Base 部分，Child 成员和 vptr 丢失
+        Base* p = &child_obj;// 不切片：指针不复制对象，Child 完整保留
+
+⑧ 析构顺序：先 Child 再 Base
+
+    构造和析构遵循对称的 LIFO 顺序：
+
+      new Child() 构造顺序：
+        1. 分配整块内存（sizeof Child，包含 Base 和 Child 所有成员）
+        2. Base::Base() 运行，初始化 Base 成员
+        3. Child::Child() 运行，初始化 Child 成员，vptr 最终写入 Child::vtable
+
+      delete p 析构顺序（虚析构）：
+        1. 读 p->vptr → 找到 Child::~Child()，执行（释放 Child 特有资源）
+        2. 编译器在 ~Child() 末尾自动插入对 ~Base() 的调用（无需手写）
+        3. Base 资源释放，内存归还
+
+      构造：Base → Child  （底层先就绪，像盖楼）
+      析构：Child → Base  （上层先拆除，像拆楼）
+
+    虚析构函数是必要前提：若析构非虚，delete p 在编译期静态绑定到 Base::~Base()，
+    ~Child() 不会被调用，Child 特有资源（如 new[] 的缓冲区）泄漏。
+
+⑨ 虚函数 vs 函数指针 vs 模板
+
+  | 机制      | 决定时机 | 运行时开销          | 典型用途                  |
+  |-----------|---------|---------------------|---------------------------|
+  | 虚函数    | 运行时  | vptr 间接寻址        | 继承层次，统一接口        |
+  | 函数指针  | 运行时  | 间接寻址（相近）     | C 风格回调，无继承        |
+  | 模板/重载 | 编译期  | 零（内联展开）       | 类型参数化，性能敏感路径  |
+
+--------------------------------------------------------------------------------
+十五、特殊成员函数细节问答
+--------------------------------------------------------------------------------
+
+【Q1：拷贝赋值为何要 release 旧对象？】
+
+  intrusive_ptr& operator=(const intrusive_ptr& other) noexcept {
+      if (ptr_ != other.ptr_) {
+          if (other.ptr_) other.ptr_->retain_();  // ① 先 retain 新对象
+          if (ptr_)       ptr_->release_();       // ② 再 release 旧对象
+          ptr_ = other.ptr_;
+      }
+      return *this;
+  }
+
+this 原来管理着旧对象，赋值后 ptr_ 改指新对象，
+旧对象失去了 this 这一个引用者，必须 release_() 归还这份引用。
+
+  赋值前：this->ptr_ → A（refcount=2），other.ptr_ → B（refcount=1）
+  ① retain B：B refcount → 2
+  ② release A：A refcount → 1（若降为 0 则 delete A）
+  ③ ptr_ = B
+  赋值后：this->ptr_ → B（refcount=2），A 仍存活（refcount=1）
+
+顺序关键：先 retain 再 release，防止自赋值时误触 delete。
+if (ptr_) 的 null 检查：ptr_ 可能是 nullptr，对 nullptr 调用成员函数是未定义行为。
+
+【Q2：移动赋值为何要 release 旧对象？】
+
+  intrusive_ptr& operator=(intrusive_ptr&& other) noexcept {
+      if (ptr_) ptr_->release_();  // ① release 当前持有的对象
+      ptr_ = other.ptr_;           // ② 接管 other 的对象
+      other.ptr_ = nullptr;        // ③ 源置空
+      return *this;
+  }
+
+与拷贝赋值同理：this 原来管理着旧对象，接管 other 后旧对象失去引用，必须 release_()。
+区别在于 other 的对象不需要 retain_()（所有权直接转移，refcount 不变）。
+
+  赋值前：this->ptr_ → A（refcount=1），other.ptr_ → B（refcount=1）
+  ① release A：A refcount → 0 → delete A
+  ② ptr_ = B（B refcount 仍为 1，未 retain）
+  ③ other.ptr_ = nullptr
+  赋值后：this->ptr_ → B（refcount=1），A 已释放
+
+【Q3：intrusive_ptr&& other 是右值引用吗？】
+
+是的。&& 声明右值引用，只能绑定到右值（临时对象或 std::move() 的结果）：
+
+  intrusive_ptr<T> a;
+  intrusive_ptr<T> b(std::move(a));  // OK：std::move(a) 是右值，绑定到 &&
+  intrusive_ptr<T> c(a);             // 调用拷贝构造，不调用移动构造
+
+注意：other 本身在移动构造函数体内是左值（有名字，有地址），
+只是其类型是右值引用。这也是为什么函数体内可以对 other 赋值（other.ptr_ = nullptr）。
+
+【Q4：移动构造会析构 other 吗？】
+
+不会。移动构造不调用 other 的析构函数，other 后续正常析构：
+
+  // 移动构造：
+  intrusive_ptr(intrusive_ptr&& other) noexcept : ptr_(other.ptr_) {
+      other.ptr_ = nullptr;   // 不是析构，只是置空
+  }
+
+  // other 的生命周期结束时，正常调用析构：
+  ~intrusive_ptr() noexcept {
+      if (ptr_) ptr_->release_();  // ptr_ 已是 nullptr，条件为假，什么都不做
+  }
+
+时序：
+  移动构造执行：ptr_ = other.ptr_，other.ptr_ = nullptr，refcount 不变
+  ...（继续使用 this）
+  other 离开作用域：~intrusive_ptr() 被调用，ptr_ 为 nullptr，release_() 不执行
+
+拷贝构造 vs 移动构造对比：
+
+  | 对比项          | 拷贝构造          | 移动构造               |
+  |-----------------|-------------------|------------------------|
+  | ptr_            | = other.ptr_      | = other.ptr_           |
+  | other.ptr_      | 不变              | 置为 nullptr           |
+  | refcount        | +1（retain）      | 不变                   |
+  | 之后 other 析构 | release_（count--）| ptr_ 为 null，无操作   |
+
+【Q5：ptr_(ptr) 是什么？】
+
+ptr_ 类型是 T*（裸指针，标量类型），ptr_(ptr) 是成员初始化列表中的直接初始化，
+等价于：
+
+  ptr_ = ptr;   // 赋值写法
+  ptr_{ptr}     // 列表初始化写法
+  ptr_(ptr)     // 直接初始化写法（成员初始化列表中常用）
+
+三者对 T* 这种标量类型效果完全相同，都是把 ptr 的地址值（8字节整数）复制给 ptr_。
+不构造任何对象，因为 T* 是指针，不是类类型，没有构造函数可调用。
+
+  执行前：
+    other.ptr_ = 0x7f3a00b80c00   → TensorImpl（refcount=1）
+
+  ptr_(other.ptr_) 执行后：
+    this->ptr_  = 0x7f3a00b80c00  ┐
+    other.ptr_  = 0x7f3a00b80c00  ┘ 两者存储相同地址，指向同一 TensorImpl
+
+复制的是地址，不是 TensorImpl 对象本身。这正是移动构造之后必须把 other.ptr_ 置为
+nullptr 的原因——否则两个句柄同时持有同一地址，析构时会 release_() 两次，
+refcount 从1降到-1，触发两次 delete（双重释放，未定义行为）。
+
