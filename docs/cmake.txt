@@ -296,6 +296,13 @@ CMakeLists.txt 完整解析
     #endif
     编译时收到 -DBLOCK_DIM_Y=1024，#ifndef 条件为假，跳过此块，使用传入值
 
+  cmake -D 与 编译器 -D 的区别（详见十九节完整流水线）：
+    cmake -DSOFTMAX_VARIANT=6   → CMake 变量，写入 CMakeCache.txt，配置阶段可读
+                                   此时源码的 #ifndef 看不到它
+    nvcc/g++ -DSOFTMAX_VARIANT=6→ C 预处理器宏，等价于 #define SOFTMAX_VARIANT 6
+                                   编译阶段预处理步骤才真正注入源码
+    target_compile_definitions  → 桥梁：读取 CMake 变量，将其写为编译器 -D 标志进 build.ninja
+
 ================================================================================
 十四、全局编译选项（add_compile_options）
 ================================================================================
@@ -442,12 +449,7 @@ CMakeLists.txt 完整解析
       WIDTH=${WIDTH}
   )
 
-  将宏定义注入编译命令，等价于 -D<宏名>=<值>。
-
-  执行阶段说明：
-    set(SOFTMAX_VARIANT 8 CACHE ...)              ← 配置阶段：值存入 CMakeCache.txt
-    target_compile_definitions(... SOFTMAX_VARIANT) ← 配置阶段：把 -DSOFTMAX_VARIANT=8 写入 build.ninja
-    nvcc 编译 kernels.cu 的预处理步骤             ← 编译阶段：读取 -D 标志，#ifndef 失效，使用传入值
+  将宏定义注入编译命令，等价于给编译器追加 -D<宏名>=<值>。
 
   与 add_compile_options 的区别：
     add_compile_options        : 对所有 target 全局生效
@@ -461,6 +463,213 @@ CMakeLists.txt 完整解析
   TORCH_EXTENSION_NAME：
     PYBIND11_MODULE 展开时使用此名称作为 Python 模块名，决定入口符号为 PyInit_softmax_cuda。
     必须与库文件名一致，否则 import 时报 ImportError。
+
+  ── cmake -D 与 编译器 -D 的区别 ────────────────────────────────────────────────
+
+  相同写法（-D），不同系统，含义完全不同：
+
+    cmake -DSOFTMAX_VARIANT=6
+      → 属于 CMake 变量系统
+      → 在配置阶段定义 CMake 变量，值 "6" 写入 CMakeCache.txt
+      → 此时源代码的 #ifndef 看不到它，它只是 CMake 的一个字符串
+
+    nvcc/g++ -DSOFTMAX_VARIANT=6
+      → 属于 C 预处理器系统
+      → 等价于在源文件第一行插入 #define SOFTMAX_VARIANT 6
+      → #ifndef SOFTMAX_VARIANT 条件为假，跳过源码中的默认值
+
+  target_compile_definitions 是两者之间的桥梁：
+    读取 CMake 变量（SOFTMAX_VARIANT = "6"），将其翻译为编译器标志 -DSOFTMAX_VARIANT=6，
+    写入 build.ninja，编译阶段 nvcc/g++ 读取后才真正成为 C 预处理器宏。
+
+================================================================================
+   完整流水线（以 cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 为例）
+================================================================================
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ 阶段一：配置阶段（Reload）                                                   │
+  │ 触发命令：                                                                   │
+  │   cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512                               │
+  │         -DCMAKE_BUILD_TYPE=Release                                           │
+  │         -DCMAKE_PREFIX_PATH=.venv/lib/.../torch/share/cmake                 │
+  │         -DPython3_ROOT_DIR=/home/liam/.../python_venv/.venv                 │
+  │         -G Ninja                                                             │
+  │         -S /home/liam/cpp_linux/Fast_Softmax                                │
+  │         -B cmake-build-release                                               │
+  └──────────────────────────────────────────────────────────────────────────────┘
+          │
+          │ cmake 读取 -D 标志，CMake 变量写入 CMakeCache.txt：
+          │   SOFTMAX_VARIANT = "6"，BLOCK_DIM_Y = "512"
+          │   CMAKE_BUILD_TYPE = "Release"，CMAKE_PREFIX_PATH = "..."
+          │
+          ▼ cmake 逐行执行 CMakeLists.txt ─────────────────────────────────────────
+
+  CMakeLists.txt 命令                       配置阶段执行的操作
+  ──────────────────────────────────────────────────────────────────────────────
+  set(CMAKE_CUDA_COMPILER "/usr/.../nvcc")  锁定 nvcc 路径，写入 CMakeCache.txt
+  set(CMAKE_CXX_COMPILER  "/usr/bin/g++")   锁定 g++ 路径
+
+  project(Fast_Softmax LANGUAGES CXX CUDA)  探测 g++ / nvcc，初始化两种语言编译器
+
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)     标记：配置完后生成 compile_commands.json
+                                            供 IDE 做头文件跳转（含所有 -I 路径）
+
+  find_package(CUDAToolkit REQUIRED)        搜索 CUDA，设置：
+                                              CUDAToolkit_INCLUDE_DIRS = /usr/local/cuda/include
+                                              CUDA::cudart IMPORTED target
+
+  find_package(Python3 REQUIRED             在 -DPython3_ROOT_DIR/.venv/bin/ 下找到 python3
+      COMPONENTS Interpreter Development)   设置：
+                                              Python3_EXECUTABLE    = .venv/bin/python3
+                                              Python3_INCLUDE_DIRS  = .venv/include/python3.13
+
+  execute_process(nvidia-smi ...)           运行 nvidia-smi，_GPU_CC = "8.6"
+  string(REPLACE "." "" ...)                _GPU_CC_NUM = "86"
+  set(TORCH_CUDA_ARCH_LIST "8.6")           供 find_package(Torch) 读取
+  unset(CMAKE_CUDA_ARCHITECTURES CACHE)     清除旧值，避免 PyTorch Warning 2
+
+  find_package(Torch REQUIRED)              从 -DCMAKE_PREFIX_PATH 目录读取
+                                            TorchConfig.cmake，设置：
+                                              TORCH_INCLUDE_DIRS   = .venv/.../torch/include
+                                              TORCH_LIBRARIES      = libtorch.so libtorch_cpu.so ...
+                                              TORCH_CXX_FLAGS      = "-D_GLIBCXX_USE_CXX11_ABI=1"
+                                              TORCH_INSTALL_PREFIX = .venv/.../torch
+
+  set(CMAKE_CUDA_ARCHITECTURES 86)          全局 GPU 架构，写入 build.ninja：
+                                              -gencode arch=compute_86,code=[sm_86,compute_86]
+
+  find_library(TORCH_PYTHON_LIBRARY ...)    找到 libtorch_python.so，路径存入变量
+
+  check_language(CUDA)                      编译最小 CUDA 代码验证 nvcc 正常
+
+  set(CMAKE_CXX_STANDARD 20)               全局 C++20，interface.cpp 继承
+
+  set(SOFTMAX_VARIANT 8 CACHE STRING "")   cache 中已有 "6"（-D 传入），不覆盖
+  set(BLOCK_DIM_Y    1024 CACHE STRING "")  cache 中已有 "512"，不覆盖
+  set(UNROLL_FACTOR  8 CACHE STRING "")    cache 无值，写入默认 8
+  set(WIDTH          0 CACHE STRING "")    cache 无值，写入默认 0
+
+  add_compile_options(                      写入全局编译标志到 build.ninja：
+    -lineinfo                               Release: nvcc -lineinfo
+    --use_fast_math                         Release: nvcc --use_fast_math
+    --ptxas-options=-v                      所有模式: nvcc --ptxas-options=-v
+  )
+  add_compile_options(${TORCH_CXX_FLAGS_LIST}) 追加 -D_GLIBCXX_USE_CXX11_ABI=1
+
+  aux_source_directory(src/kernels KERNELS) KERNELS = src/kernels/softmax_kernel.cu
+
+  add_library(softmax_cuda SHARED           注册 target，声明源文件：
+      src/interface.cpp                       → g++ 编译
+      src/run_kernels.cu                      → nvcc 编译
+      src/kernels/softmax_kernel.cu)          → nvcc 编译
+
+  execute_process(python3 -c "sysconfig...")  _PY_EXT_SUFFIX = ".cpython-313-x86_64-linux-gnu.so"
+  set_target_properties(PREFIX "" SUFFIX ...) 输出名：softmax_cuda.cpython-313-...so
+
+  target_compile_definitions(               ← 关键桥梁：读取 CMake 变量 → 写编译器 -D 到 build.ninja
+      softmax_cuda PRIVATE
+      TORCH_EXTENSION_NAME=softmax_cuda       build.ninja: -DTORCH_EXTENSION_NAME=softmax_cuda
+      BLOCK_DIM_Y=${BLOCK_DIM_Y}              build.ninja: -DBLOCK_DIM_Y=512    ← CMake变量"512"→编译器宏
+      UNROLL_FACTOR=${UNROLL_FACTOR}          build.ninja: -DUNROLL_FACTOR=8
+      SOFTMAX_VARIANT=${SOFTMAX_VARIANT}      build.ninja: -DSOFTMAX_VARIANT=6  ← CMake变量"6"→编译器宏
+      WIDTH=${WIDTH}                          build.ninja: -DWIDTH=0
+  )
+
+  target_include_directories(softmax_cuda   写入 -I 标志到 build.ninja（同时进 compile_commands.json）：
+      ${CUDAToolkit_INCLUDE_DIRS}             -I/usr/local/cuda/include
+      ${TORCH_INCLUDE_DIRS}                   -I.venv/.../torch/include
+      ${Python3_INCLUDE_DIRS}                 -I.venv/include/python3.13
+  )
+
+  target_link_libraries(softmax_cuda        写入链接标志到 build.ninja：
+      CUDA::cudart                            -lcudart
+      ${TORCH_LIBRARIES}                      -ltorch -ltorch_cpu -lc10 ...
+      ${TORCH_PYTHON_LIBRARY}                 -ltorch_python
+  )
+
+  set_target_properties(                    写入编译标准到 build.ninja：
+      CXX_STANDARD  20                        g++ -std=c++20
+      CUDA_STANDARD 20                        nvcc -std=c++20（无全局变量可继承）
+  )
+  ──────────────────────────────────────────────────────────────────────────────
+
+  配置阶段输出（写入 cmake-build-release/ 目录）：
+    CMakeCache.txt         CMake 变量持久化（SOFTMAX_VARIANT=6，BLOCK_DIM_Y=512 ...）
+    build.ninja            完整编译规则，含所有 -D / -I / -l / -std 标志
+    compile_commands.json  IDE 头文件跳转索引（含所有 -I 路径）
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ 阶段二：编译阶段（Build）                                                    │
+  │ 触发命令（二选一，等价）：                                                   │
+  │   ninja -C cmake-build-release softmax_cuda -j 18                           │
+  │   cmake --build cmake-build-release --target softmax_cuda -- -j 18          │
+  └──────────────────────────────────────────────────────────────────────────────┘
+          │
+          │ ninja 读取 build.ninja，并行启动编译任务
+          │
+          ├─ 任务 1：g++ src/interface.cpp ──────────────────────────────────────
+          │
+          │   g++ src/interface.cpp
+          │       -std=c++20
+          │       -I/usr/local/cuda/include -I.venv/.../torch/include -I.venv/include/python3.13
+          │       -DTORCH_EXTENSION_NAME=softmax_cuda     ← 编译器 -D → 预处理器宏
+          │       -DBLOCK_DIM_Y=512                       ← 编译器 -D → 预处理器宏
+          │       -D_GLIBCXX_USE_CXX11_ABI=1
+          │       -o interface.cpp.o
+          │
+          │   预处理步骤（g++ 内部）：
+          │     -DTORCH_EXTENSION_NAME=softmax_cuda
+          │       等价于 #define TORCH_EXTENSION_NAME softmax_cuda
+          │       PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+          │         → PYBIND11_MODULE(softmax_cuda, m)
+          │         → 生成入口符号 PyInit_softmax_cuda
+          │
+          ├─ 任务 2：nvcc src/run_kernels.cu ────────────────────────────────────
+          │
+          │   nvcc src/run_kernels.cu
+          │        -std=c++20
+          │        -gencode arch=compute_86,code=[sm_86,compute_86]
+          │        -I/usr/local/cuda/include -I.venv/.../torch/include
+          │        -lineinfo --use_fast_math --ptxas-options=-v
+          │        -DSOFTMAX_VARIANT=6                    ← 编译器 -D → 预处理器宏
+          │        -DBLOCK_DIM_Y=512                      ← 编译器 -D → 预处理器宏
+          │        -DUNROLL_FACTOR=8 -DWIDTH=0
+          │        -DTORCH_EXTENSION_NAME=softmax_cuda
+          │        -D_GLIBCXX_USE_CXX11_ABI=1
+          │        -o run_kernels.cu.o
+          │
+          │   预处理步骤（nvcc 内部）：
+          │     -DSOFTMAX_VARIANT=6
+          │       等价于在文件顶部插入 #define SOFTMAX_VARIANT 6
+          │       #ifndef SOFTMAX_VARIANT → 已定义，条件为假，跳过默认值 8
+          │       softmax_kernel<SOFTMAX_VARIANT> → softmax_kernel<6>
+          │
+          │     -DBLOCK_DIM_Y=512
+          │       等价于插入 #define BLOCK_DIM_Y 512
+          │       #ifndef BLOCK_DIM_Y → 已定义，跳过默认值 1024
+          │       dim3 block_size(1, BLOCK_DIM_Y, 1) → dim3 block_size(1, 512, 1)
+          │
+          │   设备代码编译：
+          │     SASS（sm_86）  → 在本机 GPU 直接执行，性能最优
+          │     PTX（compute_86）→ 嵌入 .o，供未来架构 JIT 编译
+          │
+          ├─ 任务 3：nvcc src/kernels/softmax_kernel.cu（同任务 2，略）──────────
+          │
+          └─ 链接：所有 .o 就绪后 ───────────────────────────────────────────────
+
+              ld -shared
+                 interface.cpp.o  run_kernels.cu.o  softmax_kernel.cu.o
+                 -lcudart -ltorch -ltorch_cpu -lc10 -ltorch_python ...
+                 -o softmax_cuda.cpython-313-x86_64-linux-gnu.so
+
+  编译阶段输出：
+    cmake-build-release/softmax_cuda.cpython-313-x86_64-linux-gnu.so
+
+  Python 加载：
+    import sys
+    sys.path.insert(0, 'cmake-build-release')
+    import softmax_cuda          # dlopen(softmax_cuda.cpython-313-...so)
+    y = softmax_cuda.softmax_cu(x)
 
 ================================================================================
 二十、target_include_directories 与 target_link_libraries
