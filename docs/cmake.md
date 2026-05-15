@@ -230,7 +230,7 @@ CMake Error in CMakeLists.txt:
 ```cmake
 # 1. 查询 GPU 架构 → _GPU_CC = "8.6"，_GPU_CC_NUM = "86"
 execute_process(COMMAND nvidia-smi ...)
-string(REPLACE "." "" _GPU_CC_NUM "${_GPU_CC}")
+string(REPLACE ".." "" _GPU_CC_NUM "${_GPU_CC}")
 
 # 2. 告知 PyTorch 目标架构（find_package(Torch) 之前）
 set(TORCH_CUDA_ARCH_LIST "${_GPU_CC}")
