@@ -608,6 +608,9 @@ set_target_properties(softmax_cuda PROPERTIES
 # 因此编译和链接均只需要 CUDA 相关头文件和库
 add_executable(validation
     src/validation.cu
+    src/runner.cu    # 提供 run_softmax_kernel_base / run_softmax_kernel_naive 的定义
+                     # validation.cu 通过 runner.cuh 看到声明，链接时从 runner.cu.o 找到定义
+                     # 不加此行：链接报 undefined reference to run_softmax_kernel_base
 )
 
 target_include_directories(validation PRIVATE
