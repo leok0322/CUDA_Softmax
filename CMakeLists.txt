@@ -351,28 +351,33 @@ add_compile_options(${TORCH_CXX_FLAGS_LIST})
 #   将完整路径列表存入变量，非递归（不扫子目录）
 #   等价于手动写：set(KERNELS src/kernels/softmax_kernel.cu ...)
 #   缺点：新增文件后需手动 Reload CMake 才能被感知（配置阶段执行一次，之后不追踪变化）
+# aux_source_directory 只收集有效源文件扩展名（.c/.cpp/.cu 等），.cuh 不在其中
+# src/kernels/ 目前只有 softmax_kernel.cuh，因此 ${KERNELS} 实际为空列表
+# 保留此变量为将来在 src/kernels/ 下添加 .cu 实现文件预留
 aux_source_directory(${PROJECT_SOURCE_DIR}/src/kernels KERNELS)
 
 # ── softmax_cuda 共享库（Python 扩展模块）────────────────────────────────────
 # 构建为 SHARED 库而非可执行文件，Python import 时动态加载 .so
 #
+# 源文件：能独立编译成 .o 目标文件的文件（.cpp / .cu）
+#   头文件（.h / .cuh）不是源文件，不单独编译，不产生 .o，
+#   通过 #include 展开进源文件，由编译器自动处理，不需要列在此处
+#
 # CMake 根据每个源文件的扩展名决定编译器，各文件独立编译为 .o，最后链接为 .so：
-#   .cpp → g++   src/interface.cpp             → interface.cpp.o
-#   .cu  → nvcc  src/kernels.cu                → kernels.cu.o
-#   .cu  → nvcc  src/kernels/softmax_kernel.cu → softmax_kernel.cu.o
+#   .cpp → g++   src/interface.cpp  → interface.cpp.o
+#   .cu  → nvcc  src/run_kernels.cu → run_kernels.cu.o
 #                     ↓ ld（链接）
 #   softmax_cuda.cpython-313-x86_64-linux-gnu.so
 #     ├── interface.cpp.o
-#     ├── kernels.cu.o
-#     └── softmax_kernel.cu.o
+#     └── run_kernels.cu.o
 #
 # 增量编译：只有内容变化的源文件重新走编译流程，其余复用已有 .o
-#   修改 kernels.cu → 只重编 kernels.cu.o，interface.cpp.o / softmax_kernel.cu.o 不变
+#   修改 run_kernels.cu → 只重编 run_kernels.cu.o，interface.cpp.o 不变
 add_library(softmax_cuda SHARED
     src/interface.cpp
-    src/kernels.cuh
     src/run_kernels.cu
-    ${KERNELS}
+    # src/kernels.cuh      ← 头文件，不产生 .o，不需要列在此处
+    # ${KERNELS}           ← src/kernels/ 下无 .cu 源文件，当前为空列表
 )
 
 # Python C 扩展的文件命名规范：
@@ -587,6 +592,42 @@ target_link_libraries(softmax_cuda PRIVATE
 set_target_properties(softmax_cuda PROPERTIES
     CXX_STANDARD  20   # 冗余但明确：interface.cpp 用 C++20 编译（继承自 CMAKE_CXX_STANDARD）
     CUDA_STANDARD 20   # 必要：kernels.cu 设备代码也用 C++20，无全局变量可继承
+    # LIBRARY_OUTPUT_DIRECTORY：共享库（.so）的输出目录
+    #   默认输出到构建目录（cmake-build-release/），改为项目根目录后
+    #   Python 脚本可直接 import，无需在 sys.path 中添加构建目录
+    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+)
+
+# ── validation 可执行文件（独立 kernel 性能测试程序）──────────────────────────
+# 与 softmax_cuda（SHARED 库）的区别：
+#   softmax_cuda : 无 main()，由 python3 dlopen 加载，用于 Python 侧调用
+#   validation   : 有 main()，./validation <kernel_num> 直接运行，用于 C++ 侧基准测试
+#
+# validation.cu 通过 runner.cuh → kernels.cuh → softmax_kernel.cuh
+# softmax_kernel.cuh 只包含纯 CUDA kernel 模板，不依赖 torch/extension.h，
+# 因此编译和链接均只需要 CUDA 相关头文件和库
+add_executable(validation
+    src/validation.cu
+)
+
+target_include_directories(validation PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}   # cuda_runtime.h / device_functions.h 等
+    # 若头文件链中出现 #include <torch/extension.h>，需额外添加：
+    #   ${TORCH_INCLUDE_DIRS}      # torch/extension.h 本身所在路径
+    #   ${Python3_INCLUDE_DIRS}    # torch/extension.h → python_headers.h → Python.h 所需
+)
+
+target_link_libraries(validation PRIVATE
+    CUDA::cudart   # cudaMalloc / cudaFree / cudaMemcpy / cudaEvent_t 等运行时符号
+)
+
+set_target_properties(validation PROPERTIES
+    CXX_STANDARD  20
+    CUDA_STANDARD 20
+    # RUNTIME_OUTPUT_DIRECTORY：可执行文件的输出目录
+    #   默认输出到构建目录（cmake-build-release/），改为项目根目录后
+    #   run.sh 中 EXEC="./validation" 可直接找到，无需指定构建目录路径
+    RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
 )
 
 # ════════════════════════════════════════════════════════════════════════════
