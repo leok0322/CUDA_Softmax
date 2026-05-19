@@ -114,11 +114,11 @@ __global__ void softmax_kernel_tree_reduction(scalar_t* __restrict__ a, scalar_t
     // 该block静态SMEM
     // 一个block的线程要么启动，要么全部启动，所以静态SMEM的分配可以放到if条件判断内
     // 修复：原为 reduction[threadNum]（VLA，运行时值），CUDA 静态 shared memory 必须用编译期常量
-    float __shared__ reduction[BLOCK_DIM_X];
+    scalar_t __shared__ reduction[BLOCK_DIM_X];
 
     // 每个block中的线程进行串行规约
     // 初始值用 -INFINITY 而非 0.0f：0.0f 在所有输入均为负数时会错误地成为最大值
-    float maxval {-INFINITY};
+    scalar_t maxval {-INFINITY};
     // 修复：原为 i 从 1 开始且不依赖 colGroup，导致所有线程计算相同元素、遗漏元素 [0]
     // 正确：从 colGroup 开始步长 threadNum，每线程覆盖自己的列组
     for (scalar_i i {colGroup}; i < totalCol; i+=threadNum) {
@@ -198,7 +198,7 @@ __global__ void softmax_kernel_tree_reduction(scalar_t* __restrict__ a, scalar_t
     }
     // 最大值规约到位置0
     maxval = reduction[0];
-    float sum = 0.f;
+    scalar_t sum = 0.f;
     // 线程进行树形规约求和
     // 先存储colGroup列的值
     for (scalar_i col {colGroup}; col < totalCol; col+=threadNum) {
@@ -226,7 +226,7 @@ __global__ void softmax_kernel_tree_reduction(scalar_t* __restrict__ a, scalar_t
       __syncthreads();
     }
     // 求和规约到位置0
-    float diversor { reduction[0] };
+    scalar_t diversor { reduction[0] };
 
     // 求这一行的softmax
     // 修复：原为 i 从 0 开始，所有线程写相同位置（0, threadNum, 2*threadNum...），大量列未写入

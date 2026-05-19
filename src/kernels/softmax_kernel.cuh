@@ -50,7 +50,7 @@ __global__ void softmax_kernel_base(scalar_t* __restrict__ a, scalar_t* __restri
     // ── Pass 1：扫描整行求最大值 ───────────────────────────────────────────
     // a[row*totalCol + i]：第 row 行第 i 列的元素（行优先存储）
     // fmaxf：单精度浮点 max，对应硬件 FMAX 指令，比 if/else 更快（无分支）
-    float maxval = a[row*totalCol];
+    scalar_t maxval = a[row*totalCol];
     for (int64_t i = 1; i<totalCol; i++)
     {
       maxval = fmaxf(maxval, a[row*totalCol + i]);
@@ -60,7 +60,7 @@ __global__ void softmax_kernel_base(scalar_t* __restrict__ a, scalar_t* __restri
     // __expf：CUDA 内置单精度快速近似 exp，精度约 2 ulp，比标准 expf 快约 2-4 倍
     //   对应 GPU 硬件的 MUFU.EX2 指令（2^x 近似，内部将 e^x 转换为 2^(x/ln2)）
     //   --use_fast_mattotalCol 会将 expf 自动替换为 __expf；本项目直接调用 __expf
-    float divisor = 0.f;
+    scalar_t divisor = 0.f;
     for (int64_t i = 0; i<totalCol; i++)
     {
       divisor += __expf(a[row*totalCol  + i] - maxval);
@@ -90,12 +90,12 @@ __global__ void softmax_kernel_naive(scalar_t* __restrict__ a, scalar_t* __restr
 
   //
   if ((initRow+row) < totalRow && (initCol+col) < totalCol) {
-    float maxval = a[(initRow+row)*totalCol];
+    scalar_t maxval = a[(initRow+row)*totalCol];
     for (scalar_i i = 1; i<totalCol; i++) {
       maxval = fmaxf(maxval, a[(initRow+row)*totalCol + i]);
     }
 
-    float divisor = 0.0f;
+    scalar_t divisor = 0.0f;
     for (scalar_i i = 0; i<totalCol; i++) {
       divisor += __expf(a[(initRow+row)*totalCol + i] - maxval);
     }
