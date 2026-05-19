@@ -6,6 +6,11 @@
 //   声明（无函数体）不产生目标代码，多份声明合法
 void run_softmax_kernel_base(uint totalRow, uint totalCol, float* A, float* out);
 
-void run_softmax_kernel_naive(uint M, uint totalCol, float* A, float* out);
+void run_softmax_kernel_naive(uint totalRow, uint totalCol, float* A, float* out);
 
 void run_softmax_kernel_tree_reduction(uint totalRow, uint totalCol, float* A, float* out);
+
+void run_softmax_kernel_warp_tree_reduction(uint totalRow, uint totalCol, float* A, float* out);
+
+
+void run_softmax_kernel_vectorize(uint totalRow, uint totalCol, float* A, float* out);

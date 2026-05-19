@@ -37,7 +37,7 @@ void randomize_matrix(float *mat, uint N) {
 // verify_matrix：逐元素对比 kernel 输出（matOut）与参考结果（matRef）
 //   允许误差 0.01（浮点计算精度差异）
 //   发现误差超限或 NaN 时打印错误信息并返回 false
-bool verify_matrix(float *matRef, float *matOut, uint64_t N) {
+bool verify_matrix(const float *matRef, const float *matOut, uint64_t N) {
     double diff = 0.0;
     for (int i = 0; i < N; i++) {
         diff = std::fabs(matRef[i] - matOut[i]);
@@ -76,8 +76,8 @@ void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
         case 1:  run_softmax_kernel_naive(totalRow, totalCol, A, out); break;
         case 2:  run_softmax_kernel_tree_reduction(totalRow, totalCol, A, out); break;
         case 3:  break;
-        case 4:  break;
-        case 5:  break;
+        case 4:  run_softmax_kernel_warp_tree_reduction(totalRow, totalCol, A, out); break;
+        case 5:  run_softmax_kernel_vectorize(totalRow, totalCol, A, out); break;
         case 6:  break;
         case 7:  break;
         case 8:  break;
@@ -170,112 +170,114 @@ int main(int argc, char **argv) {
     // ── 主测试循环 ────────────────────────────────────────────────────────────
     long repeat_times {50};   // 每个 size 重复 50 次取平均，减少 GPU 调度抖动影响
 
-    for (uint size : SIZE) {
-        m = n = size;
-        std::cout << "dimensions(m=n) " << m << std::endl;
+    if (kernel_num != 3) {
+        for (uint size : SIZE) {
+            m = n = size;
+            std::cout << "dimensions(m=n) " << m << std::endl;
 
-        // ── 正确性验证（kernel 0 为参考基准）────────────────────────────────
-        if (kernel_num != 0) {
-            try {
-                run_kernel(0,          m, n, dA, dout_ref, deviceIdx); // 参考 kernel（base）
-                run_kernel(kernel_num, m, n, dA, dout,     deviceIdx); // 待测 kernel
-                cudaCheck(cudaDeviceSynchronize()); // 等待 GPU 完成，确保结果就绪再拷回
-            } catch (const std::exception &e) {
-                fprintf(stderr, "%s\n", e.what());
-                exit(EXIT_FAILURE);
-            }
-
-            // Device → Host：将 GPU 结果拷回 CPU 做数值对比
-            cudaCheck(cudaMemcpy(out_ref, dout_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost));
-            cudaCheck(cudaMemcpy(out,     dout,     sizeof(float) * m * n, cudaMemcpyDeviceToHost));
-
-            if (!verify_matrix(out_ref, out, static_cast<uint64_t>(m) * n)) {
-                std::cout << "Failed to pass the correctness verification." << std::endl;
-                if (m <= 128) {
-                    // 仅在小矩阵时记录完整数据，大矩阵文件过大
-                    std::cout << " Logging faulty output into " << errLogFile << "\n";
-                    std::ofstream fs;
-                    // open() 默认 std::ios::out，隐含 std::ios::trunc：
-                    //   清空文件内容，写指针归零 → 覆盖模式
-                    //   "覆盖 vs 追加" 只在 open() 时生效，后续写入与此无关
-                    fs.open(errLogFile);
-                    // 以下三组写入是对同一个已打开流的顺序写入，不是"追加模式"：
-                    //   每次 << 或 print_matrix 写完后写指针自动后移
-                    //   文件只 open() 一次，写指针连续推进，不会相互覆盖
-                    //   类比：打开文档清空内容后连续打三段话，每段接在上一段之后
-                    fs << "A:\n";       print_matrix(A,       m, n, fs);
-                    fs << "out:\n";     print_matrix(out,     m, n, fs);
-                    fs << "out_ref:\n"; print_matrix(out_ref, m, n, fs);
-                    // fs 在此作用域结束时析构，析构函数自动调用 close()
+            // ── 正确性验证（kernel 0 为参考基准）────────────────────────────────
+            if (kernel_num != 0) {
+                try {
+                    run_kernel(0,          m, n, dA, dout_ref, deviceIdx); // 参考 kernel（base）
+                    run_kernel(kernel_num, m, n, dA, dout,     deviceIdx); // 待测 kernel
+                    cudaCheck(cudaDeviceSynchronize()); // 等待 GPU 完成，确保结果就绪再拷回
+                } catch (const std::exception &e) {
+                    fprintf(stderr, "%s\n", e.what());
+                    exit(EXIT_FAILURE);
                 }
-                exit(EXIT_FAILURE);
+
+                // Device → Host：将 GPU 结果拷回 CPU 做数值对比
+                cudaCheck(cudaMemcpy(out_ref, dout_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost));
+                cudaCheck(cudaMemcpy(out,     dout,     sizeof(float) * m * n, cudaMemcpyDeviceToHost));
+
+                if (!verify_matrix(out_ref, out, static_cast<uint64_t>(m) * n)) {
+                    std::cout << "Failed to pass the correctness verification." << std::endl;
+                    if (m <= 128) {
+                        // 仅在小矩阵时记录完整数据，大矩阵文件过大
+                        std::cout << " Logging faulty output into " << errLogFile << "\n";
+                        std::ofstream fs;
+                        // open() 默认 std::ios::out，隐含 std::ios::trunc：
+                        //   清空文件内容，写指针归零 → 覆盖模式
+                        //   "覆盖 vs 追加" 只在 open() 时生效，后续写入与此无关
+                        fs.open(errLogFile);
+                        // 以下三组写入是对同一个已打开流的顺序写入，不是"追加模式"：
+                        //   每次 << 或 print_matrix 写完后写指针自动后移
+                        //   文件只 open() 一次，写指针连续推进，不会相互覆盖
+                        //   类比：打开文档清空内容后连续打三段话，每段接在上一段之后
+                        fs << "A:\n";       print_matrix(A,       m, n, fs);
+                        fs << "out:\n";     print_matrix(out,     m, n, fs);
+                        fs << "out_ref:\n"; print_matrix(out_ref, m, n, fs);
+                        // fs 在此作用域结束时析构，析构函数自动调用 close()
+                    }
+                    exit(EXIT_FAILURE);
+                }
             }
-        }
 
-        // ── 性能测试（repeat_times 次取平均）────────────────────────────────
-        cudaEventRecord(beg);
-        for (int j = 0; j < repeat_times; j++) {
-            try {
-                run_kernel(kernel_num, m, n, dA, dout, deviceIdx);
-            } catch (const std::exception &e) {
-                fprintf(stderr, "%s\n", e.what());
+            // ── 性能测试（repeat_times 次取平均）────────────────────────────────
+            cudaEventRecord(beg);
+            for (int j = 0; j < repeat_times; j++) {
+                try {
+                    run_kernel(kernel_num, m, n, dA, dout, deviceIdx);
+                } catch (const std::exception &e) {
+                    fprintf(stderr, "%s\n", e.what());
+                }
             }
-        }
-        cudaEventRecord(end);
-        cudaCheck(cudaEventSynchronize(end)); // 等待 end 事件完成，确保计时准确
-        cudaEventElapsedTime(&elapsed_time, beg, end);
-        elapsed_time /= 1000.f;  // 毫秒 → 秒
+            cudaEventRecord(end);
+            cudaCheck(cudaEventSynchronize(end)); // 等待 end 事件完成，确保计时准确
+            cudaEventElapsedTime(&elapsed_time, beg, end);
+            elapsed_time /= 1000.f;  // 毫秒 → 秒
 
-        // ── FLOPS 计算 ────────────────────────────────────────────────────────
-        // softmax 每行 n 个元素的操作数估算（3 pass）：
-        //   Pass1（求 max）   : n 次 fmaxf                          = n
-        //   Pass2（求 exp 之和）: n 次减法 + n 次 exp + n 次加法    = 3n
-        //   Pass3（归一化）  : n 次减法 + n 次 exp + n 次除法       = 3n
-        //   每行合计：7n 次；m 行总计：7n × m
-        // 修复1：原公式 (n+2n+3)*m*n 多乘了一个 n（应为每行操作数 × 行数，而非 ×m×n）
-        // 修复2：原公式每趟均漏算减法（a[i]-maxval），导致 Pass2/3 各少 n 次操作
-        // 修复3：原为 uint 运算后赋给 long，N≥2048 时超出 UINT_MAX 发生截断，改为 long long
-        long long floatPointOperations = static_cast<long long>(7 * n) * m;
-        // 用 double 避免 float 精度不足（float 只有 ~7 位有效数字，大矩阵时丢失精度）
-        double flops = (static_cast<double>(repeat_times) * static_cast<double>(floatPointOperations) * 1e-9) / elapsed_time;
-        fprintf(stdout,
-                "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: (%u).\n",
-                elapsed_time / static_cast<float>(repeat_times), flops, m);
-        fflush(stdout);
+            // ── FLOPS 计算 ────────────────────────────────────────────────────────
+            // softmax 每行 n 个元素的操作数估算（3 pass）：
+            //   Pass1（求 max）   : n 次 fmaxf                          = n
+            //   Pass2（求 exp 之和）: n 次减法 + n 次 exp + n 次加法    = 3n
+            //   Pass3（归一化）  : n 次减法 + n 次 exp + n 次除法       = 3n
+            //   每行合计：7n 次；m 行总计：7n × m
+            // 修复1：原公式 (n+2n+3)*m*n 多乘了一个 n（应为每行操作数 × 行数，而非 ×m×n）
+            // 修复2：原公式每趟均漏算减法（a[i]-maxval），导致 Pass2/3 各少 n 次操作
+            // 修复3：原为 uint 运算后赋给 long，N≥2048 时超出 UINT_MAX 发生截断，改为 long long
+            long long floatPointOperations = static_cast<long long>(7 * n) * m;
+            // 用 double 避免 float 精度不足（float 只有 ~7 位有效数字，大矩阵时丢失精度）
+            double flops = (static_cast<double>(repeat_times) * static_cast<double>(floatPointOperations) * 1e-9) / elapsed_time;
+            fprintf(stdout,
+                    "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: (%u).\n",
+                    elapsed_time / static_cast<float>(repeat_times), flops, m);
+            fflush(stdout);
 
-        // ── 结果写入文件 ──────────────────────────────────────────────────────
-        std::filesystem::create_directories(resultDir);
-        const std::string resultLogFile = resultDir + "/softmax_kernel_" + argv[1] + "_result.txt";
-        // fs 在 for 循环体内声明：每次迭代创建新对象，迭代结束析构 → 自动 close()
-        //   因此每次迭代都要重新 open()，open() 的模式决定文件内容是否保留
-        std::ofstream fs;
-        if (m == SIZE[0]) {
-            // 第一个 size：覆盖模式（默认 std::ios::out | std::ios::trunc）
-            //   清空上次运行的旧结果，写入本次运行的表头
-            fs.open(resultLogFile);
-            fs << "Running kernel " << kernel_num << " on device " << deviceIdx << ".\n";
-        } else {
-            // 后续 size：必须用 std::ios::app（追加模式）
-            //   若用默认 open()，文件被 trunc 清空，前几次 size 的结果全部丢失
-            //   std::ios::app：每次 open() 时写指针跳到文件末尾，保留已有内容
-            fs.open(resultLogFile, std::ios::app);
+            // ── 结果写入文件 ──────────────────────────────────────────────────────
+            std::filesystem::create_directories(resultDir);
+            const std::string resultLogFile = resultDir + "/softmax_kernel_" + argv[1] + "_result.txt";
+            // fs 在 for 循环体内声明：每次迭代创建新对象，迭代结束析构 → 自动 close()
+            //   因此每次迭代都要重新 open()，open() 的模式决定文件内容是否保留
+            std::ofstream fs;
+            if (m == SIZE[0]) {
+                // 第一个 size：覆盖模式（默认 std::ios::out | std::ios::trunc）
+                //   清空上次运行的旧结果，写入本次运行的表头
+                fs.open(resultLogFile);
+                fs << "Running kernel " << kernel_num << " on device " << deviceIdx << ".\n";
+            } else {
+                // 后续 size：必须用 std::ios::app（追加模式）
+                //   若用默认 open()，文件被 trunc 清空，前几次 size 的结果全部丢失
+                //   std::ios::app：每次 open() 时写指针跳到文件末尾，保留已有内容
+                fs.open(resultLogFile, std::ios::app);
+            }
+            // 以下写入是对同一个已打开流的顺序写入（写指针自动后移），与覆盖/追加模式无关
+            fs << "dimensions(m=n) " << m << "\n";
+            fs << std::fixed << std::setprecision(6)
+               << "Average elapsed time: (" << elapsed_time / static_cast<float>(repeat_times) << ") s, performance: (";
+            fs << std::setprecision(1) << flops << ") GFLOPS. size: (" << m << ").\n";
+
         }
-        // 以下写入是对同一个已打开流的顺序写入（写指针自动后移），与覆盖/追加模式无关
-        fs << "dimensions(m=n) " << m << "\n";
-        fs << std::fixed << std::setprecision(6)
-           << "Average elapsed time: (" << elapsed_time / static_cast<float>(repeat_times) << ") s, performance: (";
-        fs << std::setprecision(1) << flops << ") GFLOPS. size: (" << m << ").\n";
+
+        // ── 资源释放 ──────────────────────────────────────────────────────────────
+        free(A);
+        free(out);
+        free(out_ref);
+        cudaCheck(cudaFree(dA));
+        cudaCheck(cudaFree(dout));
+        cudaCheck(cudaFree(dout_ref));
+        cudaCheck(cudaEventDestroy(beg));
+        cudaCheck(cudaEventDestroy(end));
     }
-
-    // ── 资源释放 ──────────────────────────────────────────────────────────────
-    free(A);
-    free(out);
-    free(out_ref);
-    cudaCheck(cudaFree(dA));
-    cudaCheck(cudaFree(dout));
-    cudaCheck(cudaFree(dout_ref));
-    cudaCheck(cudaEventDestroy(beg));
-    cudaCheck(cudaEventDestroy(end));
-
     return 0;
 }
