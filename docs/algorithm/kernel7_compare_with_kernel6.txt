@@ -1,0 +1,105 @@
+kernel7 vs kernel6：性能差异分析
+==================================
+
+
+一、两个改动
+------------
+
+kernel7 相比 kernel6 做了两处改动：
+  1. 主数据循环加 #pragma unroll URF
+  2. shuffle 规约从 __shfl_xor_sync 改为 __shfl_down_sync
+
+
+二、#pragma unroll URF：有性能提升
+------------------------------------
+
+作用于主数据循环：
+
+  #pragma unroll URF
+  for (int i = ty; i < w/4; i += BLOCK_DIM_X) {
+      float4 val = load(&a[row*w + i*4]);
+      maxval = fmaxf(maxval, val.x/y/z/w);
+  }
+
+展开 URF=4 后，编译器将循环体复制 4 份，步长扩大为 4*BLOCK_DIM_X：
+
+  float4 val0 = load(&a[... + (ty              )*16]);   // 地址偏移 0
+  float4 val1 = load(&a[... + (ty +   BLOCK_DIM_X)*16]); // 地址偏移 16384 bytes
+  float4 val2 = load(&a[... + (ty + 2*BLOCK_DIM_X)*16]); // 地址偏移 32768 bytes
+  float4 val3 = load(&a[... + (ty + 3*BLOCK_DIM_X)*16]); // 地址偏移 49152 bytes
+  maxval = fmaxf(maxval, val0.x/y/z/w);
+  maxval = fmaxf(maxval, val1.x/y/z/w);
+  maxval = fmaxf(maxval, val2.x/y/z/w);
+  maxval = fmaxf(maxval, val3.x/y/z/w);
+
+4 个 load 地址相差 16384 bytes，属于完全不同的 cache line，互相独立。
+以 warp 为单位：4 次展开 × 32 线程 × 16 bytes = 2048 bytes = 16 条 cache line 同时在途。
+
+【提升来源】
+
+1. MLP（occupancy 低时有效）
+   warp 数量不足以靠 TLP 饱和带宽时，MLP 补偿：16 条 cache line 并发请求，
+   带宽利用率从 <100% 升向峰值。
+   注意：合并访问已保证 cache line 利用率 100%，MLP 解决的是并发请求数不足的问题。
+   当 occupancy 已足够高时，TLP 已饱和带宽，MLP 无额外收益。
+
+2. 延迟隐藏（始终有效）
+   编译器将 4 条 load 集中提前发射，在等待 load 返回期间（~200-400 cycles）
+   执行已返回数据的 fmaxf，计算填满等待窗口。
+
+3. 减少循环控制开销（始终有效）
+   branch + counter 指令减少 4 倍，释放的 issue slot 全部给 FMA。
+
+【不提升的指标】
+  · 计算强度（FLOPs/byte）：展开前后相同，算法不变
+  · cache line 利用率：合并访问已保证 100%，与展开无关
+  · occupancy 高时的带宽利用率：TLP 已饱和，展开对带宽无额外贡献
+
+
+三、__shfl_down_sync 替代 __shfl_xor_sync：无性能提升
+-------------------------------------------------------
+
+kernel6 使用 __shfl_xor_sync（蝶形）：
+  for (int mask = 16; mask > 0; mask /= 2)
+      maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffff, maxval, mask, 32));
+  // 5 次 shuffle + 5 次 fmaxf，32 个 lane 都持有最终结果
+
+kernel7 改为 __shfl_down_sync（单向）：
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, 16, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  8, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  4, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  2, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  1, 32));
+  // 5 次 shuffle + 5 次 fmaxf，只有 lane0 持有最终结果
+
+【为什么没有性能差异】
+
+GPU SIMT 模型：warp 内所有 lane 执行相同指令，无法跳过。
+
+  __shfl_down_sync delta=16 时：
+    lane 0  读 lane 16 → 结果有效
+    lane 16 读 lane 32（越界）→ 返回自身值，结果无意义，但指令仍然执行
+
+  两者指令数对比：
+    __shfl_xor_sync：5次 shuffle + 5次 fmaxf = 10 条指令
+    __shfl_down_sync：5次 shuffle + 5次 fmaxf = 10 条指令
+    硬件执行周期：相同
+
+【down 替代 xor 的唯一意义】
+
+  语义更准确：softmax 中只有 lane0 写入 smem，__shfl_down_sync 明确表达
+              "只需 lane0 持有结果"的意图，代码可读性更好。
+  性能：无差异。
+
+  注：之前注释"避免 xor 蝶形对高索引 lane 的无用计算"是错误的描述，
+      高索引 lane 仍然执行了完全相同数量的指令。
+
+
+四、总结
+--------
+
+  | 改动                    | 性能提升         | 原因                                   |
+  |-------------------------|------------------|----------------------------------------|
+  | #pragma unroll URF      | 有               | MLP（低occupancy）+ 延迟隐藏 + 减少循环开销 |
+  | __shfl_down_sync 替代   | 无               | SIMT下所有lane仍执行相同指令            |
+  | shuffle 手动展开        | 有（间接）       | delta成编译期常量，生成立即数PTX指令    |

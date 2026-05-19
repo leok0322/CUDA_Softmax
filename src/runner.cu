@@ -95,7 +95,7 @@ void run_softmax_kernel_vectorize(uint totalRow, uint totalCol, float* A, float*
   dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
   dim3 grid_size = dim3(1, totalRow, 1);
   assert(totalCol % 4 == 0 && "线程刚好能用flot4完全覆盖");
-  softmax_kernel_vectorize<float, float4,uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  softmax_kernel_vectorize<float, float4, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
 
@@ -103,6 +103,14 @@ void run_softmax_kernel_threadNum1024_double_warp_tree_reduction(uint totalRow, 
   dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
   dim3 grid_size = dim3(1, totalRow, 1);
   assert(totalCol % 4 == 0 && "线程刚好能用flot4完全覆盖");
-  softmax_kernel_threadNum1024_double_warp_tree_reduction<float, float4,uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  softmax_kernel_threadNum1024_double_warp_tree_reduction<float, float4, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  cudaCheck(cudaGetLastError());
+}
+
+void run_softmax_kernel_using_shfl_down_sync_and_unroll(uint totalRow, uint totalCol, float* A, float* out) {
+  dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
+  dim3 grid_size = dim3(1, totalRow, 1);
+  assert(totalCol % 4 == 0 && "线程刚好能用flot4完全覆盖");
+  softmax_kernel_using_shfl_down_sync_and_unroll<float, float4, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }

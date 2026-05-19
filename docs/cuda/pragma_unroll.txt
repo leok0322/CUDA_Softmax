@@ -1,0 +1,258 @@
+编译器指令 #pragma unroll
+==========================
+
+
+一、什么是 #pragma
+------------------
+
+#pragma 是 C/C++ 标准定义的编译器扩展机制，允许编译器厂商添加自定义指令。
+格式：#pragma <指令>
+
+特点：
+  · 不是 C++ 宏（不做文本替换），而是向编译器传递提示/控制信息
+  · 编译器不认识的 #pragma 直接忽略，不报错
+  · 非 C++ 标准，属于编译器自定义扩展，不同编译器实现可能不同
+  · 处理阶段在编译优化阶段，而非预处理阶段
+
+| 对比项       | #pragma unroll     | #define 宏       |
+|--------------|--------------------|------------------|
+| 本质         | 编译器指令         | 文本替换         |
+| 处理阶段     | 编译优化阶段       | 预处理阶段       |
+| 作用         | 影响编译器行为     | 替换代码文本     |
+| 是否 C++ 标准 | 否（编译器扩展）  | 是               |
+| 不认识时     | 忽略，不报错       | 报错             |
+
+
+二、#pragma unroll 的作用
+--------------------------
+
+告知编译器将循环体展开 N 份，减少循环控制开销（branch、counter update），
+提高指令级并行（ILP），让更多计算指令连续进入流水线。
+
+语法：
+  #pragma unroll        // 完全展开（循环次数必须是编译期常数）
+  #pragma unroll N      // 展开 N 份（N 是编译期常数，循环总次数可以是运行期值）
+  #pragma unroll 1      // 禁止展开（即使编译器默认会展开）
+
+
+三、举例
+--------
+
+--- 示例1：完全展开（循环次数编译期已知）---
+
+原始代码：
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+      a[i] = b[i] + c[i];
+  }
+
+编译器展开后等价于：
+  a[0] = b[0] + c[0];
+  a[1] = b[1] + c[1];
+  a[2] = b[2] + c[2];
+  a[3] = b[3] + c[3];
+
+效果：消除 4 次 branch + 4 次 counter 更新，4 条加法指令连续发射。
+
+
+--- 示例2：部分展开（循环次数运行期确定）---
+
+  constexpr int URF = 4;
+  #pragma unroll URF
+  for (int i = ty; i < w/4; i += BLOCK_DIM_X) {
+      float4 val = load(&a[row*w + i*4]);
+      maxval = fmaxf(maxval, val.x);
+      ...
+  }
+
+编译器将循环体复制 4 份，步长变为 BLOCK_DIM_X*4：
+  // 第1份：i = ty
+  float4 val1 = load(&a[row*w + ty*4]);        maxval = fmaxf(...);
+  // 第2份：i = ty + BLOCK_DIM_X
+  float4 val2 = load(&a[row*w + (ty+1024)*4]); maxval = fmaxf(...);
+  // 第3份：i = ty + BLOCK_DIM_X*2
+  float4 val3 = load(&a[row*w + (ty+2048)*4]); maxval = fmaxf(...);
+  // 第4份：i = ty + BLOCK_DIM_X*3
+  float4 val4 = load(&a[row*w + (ty+3072)*4]); maxval = fmaxf(...);
+  // 剩余不足4份的迭代走原始循环
+
+效果：
+  · branch 次数降为 1/4
+  · 4个 load 独立，编译器可以同时调度，内存延迟互相掩盖
+  · 4条 fmaxf 之间无依赖，ILP 提升
+
+
+--- 示例3：在 CUDA shuffle 规约中保证 delta 是编译期常数 ---
+
+错误写法（delta 是运行期变量）：
+  for (int i = 16; i>=1; i/=2)
+      maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, i, 32));
+  // i 是运行期变量，__shfl_down_sync 的 delta 无法生成最优 PTX 立即数指令
+
+正确写法（加 #pragma unroll，i 在展开后变为编译期常数）：
+  #pragma unroll
+  for (int i = 16; i>=1; i/=2)
+      maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, i, 32));
+
+展开后等价于：
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, 16, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  8, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  4, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  2, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  1, 32));
+
+【立即数 vs 编译期常量】
+
+  编译期常量（compile-time constant）：编译器在编译阶段就知道其值，如字面量 16、8。
+  立即数（immediate）：编译期常量在 PTX/机器指令中的编码方式，值直接嵌入指令字节流，
+                       不占寄存器，不需要寄存器读取周期。
+
+  两者关系：编译期常量 → 使能编译器生成立即数指令；非编译期常量 → 只能用寄存器寻址。
+
+  PTX 对比：
+    delta = 16（编译期常量）→ shfl.sync.down.b32 %dst, %src, 16, 32   // 16 是立即数
+    delta = i （运行期变量）→ shfl.sync.down.b32 %dst, %src, %r1, 32  // %r1 是寄存器
+
+【此处 #pragma unroll 的唯一目的】
+
+  shuffle 规约循环存在严格的串行依赖链：
+    step1: maxVal = fmaxf(maxVal, shfl(maxVal, 16))  ← 更新 maxVal
+    step2: maxVal = fmaxf(maxVal, shfl(maxVal,  8))  ← 依赖 step1 结果
+    step3: 依赖 step2 … step5: 依赖 step4
+
+  因此展开前后指令执行顺序完全相同：
+    · 无 ILP（每步依赖上一步的 maxVal，无法并行）
+    · 无 MLP（shuffle 是寄存器操作，不访问内存）
+    · 无循环开销收益（仅 5 次迭代，branch 开销可忽略）
+
+  #pragma unroll 在此处的唯一作用：
+    将 i 从运行期变量变为编译期字面量（16/8/4/2/1），
+    使 __shfl_down_sync 的 delta 生成立即数 PTX 指令，而非寄存器寻址。;
+
+
+四、URF 必须是 constexpr int，不能是 #define 宏
+--------------------------------------------------
+
+#pragma unroll N 中的 N，在 nvcc 中走的是 C++ 常量表达式求值，
+而非预处理器宏替换。
+
+  // 错误：#define 宏只存在于预处理器域，nvcc 在 C++ 域找不到 URF
+  #define URF 4
+  #pragma unroll URF     // error: identifier "URF" is undefined
+
+  // 正确：constexpr int 是真正的 C++ 编译期常量，nvcc 可识别
+  constexpr int URF = 4;
+  #pragma unroll URF     // OK
+
+  // 错误：-DUNROLL_FACTOR=8 与 #define UNROLL_FACTOR 8 本质相同，
+  //        都是预处理器宏，nvcc 在 C++ 域同样找不到
+  #pragma unroll UNROLL_FACTOR   // error: identifier "UNROLL_FACTOR" is undefined
+
+本质区别：
+
+  | 定义方式              | 存在于     | pragma unroll 能否识别 |
+  |-----------------------|------------|------------------------|
+  | #define URF 4         | 预处理器域 | 不支持（此 nvcc 版本）  |
+  | -DURF=4 编译标志      | 预处理器域 | 不支持（与 #define 等价）|
+  | constexpr int URF = 4 | C++ 编译期 | 支持                   |
+
+结论：无论是文件内 #define 还是 -D 编译标志，本质都是预处理器宏，
+      #pragma unroll 的参数在此 nvcc 版本中走 C++ 常量表达式求值，
+      唯一可靠的写法是 constexpr int。
+
+
+五、#pragma unroll URF 如何提升 GFLOPS
+---------------------------------------
+
+以下面的串行规约循环为例：
+
+  #pragma unroll URF   // URF = 4
+  for (scalar_i i {threadIDX}; i < totalCol / 4; i+=threadNum) {
+      scalar_t4 vecA = reinterpret_cast<scalar_t4*>(&a[...+ i*4])[0];
+      maxVal = fmaxf(maxVal, vecA.x);
+      maxVal = fmaxf(maxVal, vecA.y);
+      maxVal = fmaxf(maxVal, vecA.z);
+      maxVal = fmaxf(maxVal, vecA.w);
+  }
+
+【展开后的等价表达式】
+
+编译器将循环体复制 4 份，步长从 threadNum 扩大为 4*threadNum：
+
+  // 宏观迭代 k（i = threadIDX + k * 4 * threadNum）
+  // 第 1 份：i0 = threadIDX
+  scalar_t4 vec0 = load(&a[... + threadIDX       * 4]);
+  // 第 2 份：i1 = threadIDX + threadNum
+  scalar_t4 vec1 = load(&a[... + (threadIDX +   threadNum) * 4]);
+  // 第 3 份：i2 = threadIDX + 2*threadNum
+  scalar_t4 vec2 = load(&a[... + (threadIDX + 2*threadNum) * 4]);
+  // 第 4 份：i3 = threadIDX + 3*threadNum
+  scalar_t4 vec3 = load(&a[... + (threadIDX + 3*threadNum) * 4]);
+
+  // 4 组 fmaxf（编译器可交错调度）
+  maxVal = fmaxf(maxVal, vec0.x); maxVal = fmaxf(maxVal, vec0.y);
+  maxVal = fmaxf(maxVal, vec0.z); maxVal = fmaxf(maxVal, vec0.w);
+  maxVal = fmaxf(maxVal, vec1.x); maxVal = fmaxf(maxVal, vec1.y);
+  maxVal = fmaxf(maxVal, vec1.z); maxVal = fmaxf(maxVal, vec1.w);
+  maxVal = fmaxf(maxVal, vec2.x); ...
+  maxVal = fmaxf(maxVal, vec3.x); ...
+
+4 个 load 地址相差 threadNum*4 个 float（= 4096 字节，BLOCK_DIM_X=1024时），
+属于 4 条完全不同的 cache line，互相独立。
+
+【三个提升 GFLOPS 的原因】
+
+1. MLP（内存级并行，occupancy 低时有效）
+   以 warp 为单位：4 次展开 × 32 线程 × 16 bytes = 2048 bytes = 16 条 cache line
+   同时在途，内存控制器并行处理。
+   注意：合并访问（coalesced）已保证 cache line 利用率 100%，
+         MLP 解决的是"并发请求数不足"而非"字节利用率"问题。
+   当 occupancy 足够高时，TLP（warp 切换）已饱和带宽，MLP 无额外收益。
+
+2. ILP + 延迟隐藏（始终有效）
+   编译器将 4 条 load 集中提前发射，在等待 load 返回期间执行已返回数据的 fmaxf，
+   计算填满内存等待窗口（全局内存延迟 ~200-400 cycles）。
+
+3. 减少循环控制开销（始终有效）
+   每次宏观迭代处理 4 份数据，branch + counter 指令减少 4 倍，
+   释放出的 issue slot 全部给 FMA。
+
+【不提升的指标】
+
+  · 计算强度（arithmetic intensity = FLOPs/byte）：展开前后相同，算法本身不变
+  · cache line 利用率：合并访问已保证 100%，与展开无关
+  · occupancy 高时的带宽利用率：TLP 已饱和，展开对带宽无额外贡献
+
+
+六、展开的代价：寄存器压力
+--------------------------
+
+展开因子越大，同时活跃的变量越多，占用寄存器越多：
+
+  URF=1：每次迭代 1 个 float4（4个寄存器）
+  URF=4：同时活跃 4 个 float4（16个寄存器）
+
+若寄存器不足（超出 register file 限制）：
+  · 编译器将寄存器溢出到 local memory（register spilling）
+  · local memory 访问延迟与全局内存相当（~200 cycle）
+  · 性能反而下降
+
+因此 URF 通常取 2~8，需在 ILP 收益和 occupancy（活跃 warp 数）之间权衡。
+
+
+五、#pragma unroll 的完全展开条件
+----------------------------------
+
+使用 #pragma unroll（无参数）完全展开时，要求循环次数是编译期常数，否则编译器忽略：
+
+  // 可以完全展开：循环次数=4，编译期已知
+  #pragma unroll
+  for (int i = 0; i < 4; i++) { ... }
+
+  // 不能完全展开：w 是运行期值，编译器忽略此 #pragma unroll
+  #pragma unroll
+  for (int i = 0; i < w; i++) { ... }
+
+  // 可以部分展开：#pragma unroll N，N 是编译期常数，循环总次数可以是运行期值
+  #pragma unroll 4
+  for (int i = 0; i < w; i++) { ... }

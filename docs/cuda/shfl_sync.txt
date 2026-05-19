@@ -1,0 +1,139 @@
+CUDA Warp Shuffle 函数详解
+==========================
+
+
+一、函数签名
+------------
+
+T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width=32)
+T __shfl_down_sync(unsigned mask, T var, unsigned delta, int width=32)
+
+参数说明：
+  mask     ：参与 shuffle 的 lane 位图，0xffffffff = 32 个 lane 全部参与
+             未参与的 lane 不能作为数据源，否则行为未定义
+  var      ：当前 lane 贡献的值（存于寄存器），返回值是对方 lane 的 var
+  laneMask ：（xor专用）当前 lane ID XOR laneMask = 对方 lane ID
+  delta    ：（down专用）lane k 读取 lane k+delta 的值
+  width    ：将 warp 切成大小为 width 的独立子组，shuffle 不跨子组边界
+
+
+二、__shfl_xor_sync：蝶形规约
+------------------------------
+
+原理：
+  lane k 与 lane (k XOR laneMask) 互相交换 var，双向对称。
+  5步（laneMask=16,8,4,2,1）后，所有 32 个 lane 均持有全局规约结果。
+
+用法示例：
+  // 求 warp 内所有 lane 的最大值，结果广播到所有 lane
+  for (int mask = 16; mask > 0; mask /= 2)
+      maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffff, maxval, mask, 32));
+
+举例（8个lane，初始值 [3,1,4,1,5,9,2,6]）：
+
+  初始：  lane0=3  lane1=1  lane2=4  lane3=1  lane4=5  lane5=9  lane6=2  lane7=6
+
+  mask=4（翻转bit2，0↔4, 1↔5, 2↔6, 3↔7）：
+    lane0=fmax(3,5)=5  lane1=fmax(1,9)=9  lane2=fmax(4,2)=4  lane3=fmax(1,6)=6
+    lane4=fmax(5,3)=5  lane5=fmax(9,1)=9  lane6=fmax(2,4)=4  lane7=fmax(6,1)=6
+
+  mask=2（翻转bit1，0↔2, 1↔3, 4↔6, 5↔7）：
+    lane0=fmax(5,4)=5  lane1=fmax(9,6)=9  lane2=fmax(4,5)=5  lane3=fmax(6,9)=9
+    lane4=fmax(5,4)=5  lane5=fmax(9,6)=9  lane6=fmax(4,5)=5  lane7=fmax(6,9)=9
+
+  mask=1（翻转bit0，0↔1, 2↔3, 4↔5, 6↔7）：
+    lane0=fmax(5,9)=9  lane1=fmax(9,5)=9  lane2=fmax(5,9)=9  lane3=fmax(9,5)=9
+    lane4=fmax(5,9)=9  lane5=fmax(9,5)=9  lane6=fmax(5,9)=9  lane7=fmax(9,5)=9
+
+  结果：所有 8 个 lane 均持有全局最大值 9 ✓
+
+特点：
+  · 双向对称：lane A 读 lane B，同时 lane B 读 lane A
+  · 5步后所有 32 lane 均有全局结果
+  · 适合后续所有 lane 都需要结果的场景（如写 smem 后再广播）
+
+
+三、__shfl_down_sync：单向下移规约
+-----------------------------------
+
+原理：
+  lane k 读取 lane k+delta 的值（单向，高索引→低索引）。
+  当 k+delta >= width 时，lane k 收到自身的值（或行为未定义，建议避免）。
+  5步后只有 lane 0 持有全局规约结果，其余 lane 值无意义。
+
+用法示例：
+  // 求 warp 内所有 lane 的最大值，结果只在 lane 0
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, 16, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  8, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  4, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  2, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  1, 32));
+
+举例（8个lane，初始值 [3,1,4,1,5,9,2,6]）：
+
+  初始：  lane0=3  lane1=1  lane2=4  lane3=1  lane4=5  lane5=9  lane6=2  lane7=6
+
+  delta=4（lane k 读 lane k+4，k+4>=8 时读自身）：
+    lane0=fmax(3,5)=5  lane1=fmax(1,9)=9  lane2=fmax(4,2)=4  lane3=fmax(1,6)=6
+    lane4=fmax(5,5)=5  lane5=fmax(9,9)=9  lane6=fmax(2,2)=2  lane7=fmax(6,6)=6
+    ↑ lane4~7 读自身，值不变
+
+  delta=2：
+    lane0=fmax(5,4)=5  lane1=fmax(9,6)=9  lane2=fmax(4,5)=5  lane3=fmax(6,9)=9
+    lane4~7 不变
+
+  delta=1：
+    lane0=fmax(5,9)=9  ← 全局最大值
+    lane1=fmax(9,6)=9  lane2=fmax(5,9)=9  lane3=fmax(9,6)=9
+    lane4~7 不变
+
+  结果：lane0=9（全局最大值），其余 lane 值无意义 ✓
+
+特点：
+  · 单向：只有低索引 lane 从高索引 lane 读值
+  · 只有 lane 0 最终持有全局结果
+  · 适合后续只有 lane 0 需要结果的场景（如 lane 0 写 smem）
+
+
+四、两者对比
+------------
+
+| 对比项               | __shfl_xor_sync      | __shfl_down_sync         |
+|----------------------|----------------------|--------------------------|
+| 交换方向             | 双向对称（k ↔ k XOR mask） | 单向（k ← k+delta）  |
+| 规约后持有结果的 lane | 全部 32 个 lane      | 只有 lane 0              |
+| 无需结果的 lane      | 仍然计算（轻微浪费） | 不积累（稍省工作量）     |
+| 典型用途             | 结果需广播给所有 lane | 只需 lane 0 写 smem      |
+
+
+五、为什么 delta 要是编译期常数
+--------------------------------
+
+__shfl_down_sync 的 delta 在 PTX 层面应为立即数（immediate value）。
+
+错误写法（delta 是运行期变量）：
+  for (int i = 16; i>=1; i/=2)
+      maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, i, 32));
+  // i 是循环变量，编译器生成通用代码路径，delta 通过寄存器传递，产生次优指令
+
+正确写法一（手动展开，delta 是立即数）：
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, 16, 32));
+  maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval,  8, 32));
+  ...
+
+正确写法二（加 #pragma unroll，编译器展开后 i 变为立即数，等价于手动展开）：
+  #pragma unroll
+  for (int i = 16; i>=1; i/=2)
+      maxval = fmaxf(maxval, __shfl_down_sync(0xffffffff, maxval, i, 32));
+
+__shfl_xor_sync 同理，laneMask 也应为编译期常数。
+
+
+六、使用场景总结
+----------------
+
+  只需 lane 0 写 smem（如 reduction_max[warp_id]）
+    → __shfl_down_sync，5步，lane 0 拿结果，其余 lane 无需关心
+
+  结果需广播给 warp 内所有 lane（如直接用规约结果参与后续计算）
+    → __shfl_xor_sync，5步，所有 lane 均持有结果
