@@ -1,0 +1,87 @@
+存储期（Storage Duration）
+==========================
+
+存储期决定变量的内存何时分配、何时释放。
+
+
+一、三种存储期对比
+------------------
+
+| 存储期   | 分配时机               | 释放时机         | 典型例子                              |
+|----------|------------------------|------------------|---------------------------------------|
+| 静态     | 程序/kernel 启动时     | 程序/kernel 结束 | 全局变量、static 局部变量、__shared__ |
+| 自动     | 进入作用域（函数调用） | 离开作用域       | 普通局部变量（栈或寄存器）            |
+| 动态     | 手动 new/malloc        | 手动 delete/free | 堆上分配的对象                        |
+
+
+二、静态存储期
+--------------
+
+变量内存在程序启动时分配，程序结束时释放，生命周期贯穿整个程序。
+
+属于静态存储期的变量：
+
+    int global = 1;          // 全局变量（天然静态存储期，无需 static 关键字）
+
+    void foo() {
+        static int s = 2;    // 局部 static 变量（升级为静态存储期）
+    }
+
+CUDA 中额外包括：
+
+    __shared__ float buf[32];   // block 内共享，kernel 执行期间一直存在
+    __device__ float d;         // 设备全局内存
+    __constant__ float c;       // 常量内存
+
+
+三、静态存储期 != static 关键字
+--------------------------------
+
+"静态存储期"是生命周期概念，"static"是关键字，两者不等价：
+
+1. 全局变量天然是静态存储期，不需要写 static
+2. static 加在局部变量上 → 把自动存储期升级为静态存储期
+3. static 加在全局变量/函数上 → 改变链接属性（限制在本文件内可见），
+   不改变存储期（全局变量本来就是静态的）
+
+    int g = 5;         // 全局变量 → .data 段，静态存储期，外部可见
+    static int h = 5;  // 全局 static → .data 段，静态存储期，仅本文件可见（内部链接）
+
+    void foo() {
+        static int s;  // 局部 static → .bss 段，静态存储期，仅函数内可见
+        int a;         // 普通局部 → 栈，自动存储期
+    }
+
+
+四、.bss 和 .data 的区别
+-------------------------
+
+静态存储期的变量分配在可执行文件的静态数据区（不在栈上）：
+
+    static int a = 5;   // → .data 段（有初始值，存入可执行文件）
+    static int b;       // → .bss 段（零初始化，不占文件体积，运行时清零）
+
+.bss/.data 段的大小由链接器在编译期确定，写入可执行文件的段表。
+
+
+五、为什么 VLA 不能有静态存储期
+--------------------------------
+
+    void foo(int n) {
+        static int arr[n];   // 编译错误
+    }
+
+- VLA（variable-length array）：数组大小是运行期才确定的值
+- 静态存储期：内存大小必须在编译/链接阶段确定
+- 两者矛盾：链接器无法在编译期决定要预留多大空间 → 报错
+
+CUDA 中的同类错误：
+
+    // scalar_i 是模板类型参数，constexpr scalar_i 不被视为整型常量表达式
+    // nvcc 将 reduction[reducNum] 当作 VLA → __shared__ 静态存储期冲突 → 报错
+    constexpr scalar_i reducNum {BLOCK_DIM_X / 32};
+    __shared__ scalar_t reduction[reducNum];   // error: VLA cannot have static storage duration
+
+    // 修复：用具体整型 constexpr uint，编译器可确认为编译期常量
+    constexpr uint reducNum {BLOCK_DIM_X / 32};
+    __shared__ scalar_t reduction[reducNum];   // OK
