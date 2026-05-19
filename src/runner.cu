@@ -89,3 +89,12 @@ void run_softmax_kernel_warp_tree_reduction(uint totalRow, uint totalCol, float*
   softmax_kernel_warp_tree_reduction<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
+
+
+void run_softmax_kernel_vectorize(uint totalRow, uint totalCol, float* A, float* out) {
+  dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
+  dim3 grid_size = dim3(1, totalRow, 1);
+  assert(totalCol % 4 == 0 && "线程刚好能用flot4完全覆盖");
+  softmax_kernel_vectorize<float, float4,uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  cudaCheck(cudaGetLastError());
+}

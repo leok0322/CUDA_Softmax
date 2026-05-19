@@ -1,0 +1,82 @@
+向量化加载（Vectorized Load）
+==============================
+
+
+一、要求
+--------
+
+1. 地址 16 字节对齐
+   float4 要求起始地址按 16 字节对齐，否则硬件触发非对齐访问，性能下降或结果错误。
+   CUDA 中用 reinterpret_cast<float4*> 时，编译器假设对齐已满足，不做运行期检查。
+
+   对齐分析：
+   · cudaMalloc 分配的基指针保证 256 字节对齐，基址本身满足要求
+   · 每行起始地址偏移 = row * totalCol * sizeof(float)
+     要使该偏移 16 字节对齐：row * totalCol * 4 ≡ 0 (mod 16)
+     即 totalCol * 4 ≡ 0 (mod 16) → totalCol % 4 == 0
+   · 行内每次迭代偏移 = i * 4 * sizeof(float) = i * 16，天然 16 字节对齐
+
+   结论：只要 totalCol % 4 == 0，所有访问均满足 16 字节对齐。
+
+   运行期检查写法：
+     assert(totalCol % 4 == 0);
+     // 或直接检查指针地址：
+     assert((uintptr_t)(&a[row * totalCol]) % 16 == 0);
+
+2. 数据长度是 4 的倍数
+   float4 每次读取 4 个 float（16 bytes）。
+   若 totalCol 不是 4 的倍数，末尾元素无法被完整覆盖，最后一次读取越界。
+
+3. 合并访问（coalesced access）
+   同一 warp 的 32 个线程应访问连续地址，使底层 32-byte sector 事务被充分利用。
+   向量化不改变 sector 的访问模式，合并与否仍取决于地址布局。
+
+
+二、优点
+--------
+
+根本原因：每条 load 指令传输字节数 ×4
+  float  load：1 指令 → 4 bytes/thread  → warp 32线程 → 128 bytes（4 sectors）
+  float4 load：1 指令 → 16 bytes/thread → warp 32线程 → 512 bytes（16 sectors）
+  相同数据量，float4 只需 1/4 的 load 指令数，所有收益均由此派生。
+
+1. 减少指令数 → 更多 FMA 槽 → FMA 流水线掩盖 load 延迟
+   - load 指令减少，调度器 issue slot 空出
+   - 更多 FMA 得以连续发射，计算流水线更满
+   - FMA 的执行掩盖了 load 的内存延迟
+   注：不能单独说"更少的 load 等待点"——底层 sector 事务数量不变，
+       合并访问后 L1 cache line 命中，后续 float load 几乎无额外等待，
+       等待点的减少是 FMA 掩盖的结果，不是独立收益。
+
+2. 减少循环开销
+   处理相同列数，循环次数减少为 1/4。
+   loop branch、loop counter 更新的指令开销相应降低。
+
+3. 减少地址生成（AGEN）开销
+   4 次地址计算 → 1 次，ALU/AGEN 单元压力降低。
+
+
+三、正确的收益链
+----------------
+
+  float4 减少指令数
+    → 调度器 issue slot 空出
+        → 更多 FMA 得以发射
+            → FMA 流水线掩盖 load 延迟
+    → 循环次数 ÷4
+        → loop branch/counter 开销降低
+    → 地址计算次数 ÷4
+        → AGEN 压力降低
+
+
+四、常见错误
+------------
+
+错误 1：地址用固定偏移（如 threadIDX*4）而非循环变量（i*4）
+  → 所有迭代读写同一位置，数据覆盖不完整
+
+错误 2：totalCol 不是 4 的倍数时直接向量化
+  → 末尾 float4 读取越界
+
+错误 3：将"更少的 load 等待点"列为独立优点
+  → 合并访问下 sector 数不变，等待点减少是 FMA 掩盖的结果，不是独立收益
