@@ -614,14 +614,19 @@ add_executable(validation
 )
 
 target_include_directories(validation PRIVATE
-    ${CUDAToolkit_INCLUDE_DIRS}   # cuda_runtime.h / device_functions.h 等
+    ${CUDAToolkit_INCLUDE_DIRS}        # cuda_runtime.h / device_functions.h 等
+    /usr/include/x86_64-linux-gnu      # cudnn.h：apt 安装 cuDNN 时头文件位于此路径
+                                       # /usr/local/cuda/include 不含 cudnn.h，需单独指定
     # 若头文件链中出现 #include <torch/extension.h>，需额外添加：
-    #   ${TORCH_INCLUDE_DIRS}      # torch/extension.h 本身所在路径
-    #   ${Python3_INCLUDE_DIRS}    # torch/extension.h → python_headers.h → Python.h 所需
+    #   ${TORCH_INCLUDE_DIRS}          # torch/extension.h 本身所在路径
+    #   ${Python3_INCLUDE_DIRS}        # torch/extension.h → python_headers.h → Python.h 所需
 )
 
 target_link_libraries(validation PRIVATE
     CUDA::cudart   # cudaMalloc / cudaFree / cudaMemcpy / cudaEvent_t 等运行时符号
+    cudnn          # cuDNN 运行时库（libcudnn.so），提供 cudnnCreate / cudnnSoftmaxForward 等符号
+                   # apt 安装路径：/usr/lib/x86_64-linux-gnu/libcudnn.so.9
+                   # 链接器在默认搜索路径中可直接找到，无需显式指定 PATHS
 )
 
 set_target_properties(validation PROPERTIES

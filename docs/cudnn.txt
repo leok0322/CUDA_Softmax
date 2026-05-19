@@ -1,0 +1,172 @@
+══════════════════════════════════════════════════════════════════════════════
+cuDNN 安装、编译配置与 Softmax API 使用
+══════════════════════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────────────────────
+一、cuDNN 是什么
+────────────────────────────────────────────────────────────────────────────
+
+cuDNN（CUDA Deep Neural Network library）是 NVIDIA 提供的深度学习原语库，
+封装了卷积、pooling、softmax、归一化等常用算子的高性能 CUDA 实现。
+
+与手写 kernel 的关系：
+  手写 kernel  : 控制每一条指令，可针对特定场景极致优化
+  cuDNN        : NVIDIA 官方实现，在通用场景下性能已接近硬件上限，
+                 适合作为正确性参照（baseline）或直接用于生产
+
+
+────────────────────────────────────────────────────────────────────────────
+二、安装
+────────────────────────────────────────────────────────────────────────────
+
+【前置条件】确认 CUDA 版本
+
+  nvcc --version
+  # 本机：CUDA 12.9
+
+【方式1：apt 安装（推荐）】
+
+  # 添加 NVIDIA apt 源（若尚未添加）
+  wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+  sudo dpkg -i cuda-keyring_1.1-1_all.deb
+  sudo apt update
+
+  # 安装 cuDNN 运行时库 + 开发头文件（对应 CUDA 12.x）
+  sudo apt install libcudnn9-cuda-12 libcudnn9-dev-cuda-12
+
+  apt 安装后的文件位置：
+    头文件 : /usr/include/x86_64-linux-gnu/cudnn.h
+    动态库 : /usr/lib/x86_64-linux-gnu/libcudnn.so.9
+
+【验证安装】
+
+  find /usr -name "cudnn.h" 2>/dev/null
+  dpkg -l | grep cudnn
+
+
+────────────────────────────────────────────────────────────────────────────
+三、CMakeLists.txt 编译配置
+────────────────────────────────────────────────────────────────────────────
+
+cuDNN 通过 apt 安装时，头文件在 /usr/include/x86_64-linux-gnu/ 而非
+/usr/include/，编译器不会自动递归搜索该子目录，需显式添加。
+
+【target_include_directories】
+
+  target_include_directories(validation PRIVATE
+      ${CUDAToolkit_INCLUDE_DIRS}        # /usr/local/cuda/include（CUDA 工具链头文件）
+      /usr/include/x86_64-linux-gnu      # cudnn.h（apt 安装路径，非 CUDA Toolkit 目录）
+  )
+
+  说明：
+    /usr/local/cuda/include 由 find_package(CUDAToolkit) 提供，含 cuda_runtime.h 等，
+    但不含 cudnn.h（cuDNN 独立安装，不在 CUDA Toolkit 目录中）。
+    因此需单独指定 /usr/include/x86_64-linux-gnu。
+
+  g++ 在 Ubuntu x86_64 上通过 multiarch 机制会自动搜索此路径，
+  nvcc 经由 CMake 调用时不一定完整继承该机制，显式添加更保险。
+
+【target_link_libraries】
+
+  target_link_libraries(validation PRIVATE
+      CUDA::cudart   # CUDA 运行时
+      cudnn          # cuDNN 运行时库（libcudnn.so）
+  )
+
+  说明：
+    libcudnn.so.9 位于 /usr/lib/x86_64-linux-gnu/，该路径在链接器默认搜索路径中，
+    直接写库名 cudnn 即可，无需 PATHS 或 find_library。
+
+【完整配置示例（validation target）】
+
+  add_executable(validation
+      src/validation.cu
+      src/runner.cu
+  )
+
+  target_include_directories(validation PRIVATE
+      ${CUDAToolkit_INCLUDE_DIRS}
+      /usr/include/x86_64-linux-gnu
+  )
+
+  target_link_libraries(validation PRIVATE
+      CUDA::cudart
+      cudnn
+  )
+
+
+────────────────────────────────────────────────────────────────────────────
+四、Softmax API 使用
+────────────────────────────────────────────────────────────────────────────
+
+【头文件】
+
+  #include <cudnn.h>
+
+【场景：对 m×n 矩阵按行做 softmax】
+
+  每行 n 个元素独立做 softmax，共 m 行。
+  将矩阵映射为 NCHW 张量：N=m（行数），C=n（列数），H=1，W=1。
+  使用 CUDNN_SOFTMAX_MODE_CHANNEL，即在 C 维度做规约（对每个 N 独立规约 C）。
+
+【完整调用流程】
+
+  // ── Step1：创建 handle ───────────────────────────────────────────────────
+  // handle 封装 cuDNN 库状态（流、工作空间等），每个线程持有一个
+  cudnnHandle_t handle;
+  cudnnCreate(&handle);
+
+  // ── Step2：创建并设置 tensor descriptor ─────────────────────────────────
+  // descriptor 描述张量的形状、布局、数据类型，softmax 算子根据它确定规约方向
+  cudnnTensorDescriptor_t desc;
+  cudnnCreateTensorDescriptor(&desc);
+  cudnnSetTensor4dDescriptor(
+      desc,
+      CUDNN_TENSOR_NCHW,   // 内存布局：行优先（N×C×H×W 连续存储）
+      CUDNN_DATA_FLOAT,    // 数据类型：float32
+      m,                   // N：行数（每行独立做 softmax）
+      n,                   // C：列数（softmax 在此维度规约）
+      1,                   // H：固定为 1
+      1                    // W：固定为 1
+  );
+
+  // ── Step3：调用 softmax ──────────────────────────────────────────────────
+  float alpha = 1.0f, beta = 0.0f;
+  // 输出 = alpha × softmax(输入) + beta × 输出（原地写时 beta=0）
+  cudnnSoftmaxForward(
+      handle,
+      CUDNN_SOFTMAX_ACCURATE,       // 数值稳定算法：先减最大值再 exp，避免溢出
+                                    // 另有 CUDNN_SOFTMAX_FAST（不减最大值，速度略快但数值不稳定）
+                                    //     CUDNN_SOFTMAX_LOG（输出 log(softmax)，用于交叉熵）
+      CUDNN_SOFTMAX_MODE_CHANNEL,   // 在 C 维度规约（对每个 N 独立处理），即按行 softmax
+                                    // 另有 CUDNN_SOFTMAX_MODE_INSTANCE（在 C×H×W 上规约）
+      &alpha,
+      desc, d_input,                // 输入张量：设备指针，形状由 desc 描述
+      &beta,
+      desc, d_output                // 输出张量：设备指针，形状同 desc
+  );
+
+  // ── Step4：释放资源 ──────────────────────────────────────────────────────
+  cudnnDestroyTensorDescriptor(desc);
+  cudnnDestroy(handle);
+
+【CUDNN_SOFTMAX_ACCURATE 的实现原理】
+
+  标准 softmax：out_i = exp(x_i) / Σexp(x_j)
+    问题：x_i 较大时 exp(x_i) 溢出为 inf
+
+  ACCURATE 算法（数值稳定版）：
+    max_val = max(x_i)
+    out_i   = exp(x_i - max_val) / Σexp(x_j - max_val)
+    减去最大值后指数项均 ≤ 1，不会溢出，数学上等价于标准公式
+
+【参数说明汇总】
+
+  cudnnSoftmaxAlgorithm_t（第2参数）：
+    CUDNN_SOFTMAX_FAST      : 不减最大值，速度最快，数值不稳定（大值溢出）
+    CUDNN_SOFTMAX_ACCURATE  : 减最大值，数值稳定（常用）
+    CUDNN_SOFTMAX_LOG       : 输出 log(softmax)，等价于 LogSoftmax，用于 NLLLoss
+
+  cudnnSoftmaxMode_t（第3参数）：
+    CUDNN_SOFTMAX_MODE_INSTANCE : 在 C×H×W 上规约（每个 N 做一次全局 softmax）
+    CUDNN_SOFTMAX_MODE_CHANNEL  : 在 C 上规约，H/W 各自独立（矩阵按行 softmax 选此项）
