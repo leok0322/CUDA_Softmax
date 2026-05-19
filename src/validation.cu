@@ -78,7 +78,7 @@ void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
         case 3:  break;
         case 4:  run_softmax_kernel_warp_tree_reduction(totalRow, totalCol, A, out); break;
         case 5:  run_softmax_kernel_vectorize(totalRow, totalCol, A, out); break;
-        case 6:  break;
+        case 6:  run_softmax_kernel_threadNum1024_double_warp_tree_reduction(totalRow, totalCol, A, out); break;
         case 7:  break;
         case 8:  break;
         case 9:  break;
