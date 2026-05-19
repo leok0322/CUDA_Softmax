@@ -29,7 +29,7 @@ set(CMAKE_CXX_COMPILER  "/usr/bin/g++")
 ### project()
 
 ```cmake
-project(Fast_Softmax LANGUAGES CXX CUDA)
+project(Fast_Softmax LANGUAGES CXX ../cuda)
 ```
 
 | 参数 | 作用 |
