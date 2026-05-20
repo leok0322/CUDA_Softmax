@@ -80,7 +80,7 @@ void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
         case 5:  run_softmax_kernel_vectorize(totalRow, totalCol, A, out); break;
         case 6:  run_softmax_kernel_threadNum1024_double_warp_tree_reduction(totalRow, totalCol, A, out); break;
         case 7:  run_softmax_kernel_using_shfl_down_sync_and_unroll(totalRow, totalCol, A, out); break;
-        case 8:  break;
+        case 8:  run_softmax_kernel_using_online_softmax(totalRow, totalCol, A, out); break;
         case 9:  break;
         case 10: break;
         case 11: break;

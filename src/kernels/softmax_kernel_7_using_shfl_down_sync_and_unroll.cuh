@@ -8,7 +8,11 @@
 #endif
 
 
+#ifndef URF_DEFINED
+#define URF_DEFINED
 constexpr int URF {4};
+#endif
+
 
 
 template <typename scalar_t>

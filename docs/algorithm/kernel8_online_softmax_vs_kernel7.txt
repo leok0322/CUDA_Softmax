@@ -1,0 +1,284 @@
+kernel8（online softmax）vs kernel7：性能改进分析
+===================================================
+
+
+一、算法对比
+------------
+
+kernel7（标准 3-pass + float4 + shfl_down_sync）：
+
+  Pass1：遍历全局内存，逐元素 fmaxf，求本线程负责列的最大值
+         → warp 内 __shfl_down_sync 规约 → smem → warp0 规约 → 写 smem → 全线程读 smem
+  Pass2：再次遍历全局内存，计算 Σexp(x_i - max)
+         → 同上规约流程
+  Pass3：再次遍历全局内存，写出 exp(x_i - max) / sum
+
+  全局内存访问：Pass1 读 + Pass2 读 + Pass3 写 = 2 次读 + 1 次写
+
+kernel8（online softmax，Pass1+2 合并）：
+
+  Pass1+2（合并）：一次遍历全局内存，同时维护 (maxVar, divisor) 对
+    · 每读入一批 4 个元素，先求批次局部 max（maxVar_switch）
+    · 然后以批次局部 max 为基准计算 exp 之和（divisor_switch）
+    · 再将批次局部状态与历史状态合并（在线合并公式）：
+        new_max  = max(m_历史, m_批次)
+        divisor  = divisor_历史 × exp(m_历史 - new_max)
+                 + divisor_批次 × exp(m_批次  - new_max)
+    → warp 内 __shfl_xor_sync 在线规约 → smem → warp0 在线规约 → 写 smem → 全线程读 smem
+  Pass3：遍历全局内存，写出 exp(x_i - max) / sum（预计算倒数 inv_divisor）
+
+  全局内存访问：Pass1+2 合并读 + Pass3 写 = 1 次读 + 1 次写
+
+
+二、性能改进来源
+----------------
+
+1. 减少一次全局内存读取
+
+  softmax 是典型的内存密集型（memory-bound）操作：
+  计算量（exp、加法、fmaxf）相对于 HBM 带宽消耗而言很小，
+  性能瓶颈在全局内存读取次数，而非算术运算。
+
+  kernel7：每个元素被读取 2 次（Pass1 + Pass2）
+  kernel8：每个元素只读取 1 次（Pass1+2 合并）
+
+  对于 totalCol=4096、float 类型：
+    每行数据量 = 4096 × 4B = 16 KB
+    kernel7 每行读 32 KB，kernel8 每行读 16 KB
+    节省 50% 的全局内存读带宽
+
+2. warp 规约方式的差异
+
+  kernel7 使用 __shfl_down_sync：
+    单向传播，只有 lane0 持有正确的规约结果，适合独立的 max 和 sum 规约。
+
+  kernel8 使用 __shfl_xor_sync（蝶形）：
+    双向传播，每步两个 lane 都更新为合并结果，是在线合并规约的必要条件：
+    在线合并 divisor 时，每一步的两端都需要持有已更新的 (max, div) 对，
+    供下一步继续合并——__shfl_down_sync 无法保证这一点。
+    （详见 online_softmax.txt 第五节）
+
+
+三、online softmax 的额外代价
+------------------------------
+
+合并两批状态时需要额外的 exp 运算：
+
+  kernel7 每轮读入：1 次 float4 load → 4 次 fmaxf（Pass1）或 4 次 exp（Pass2）
+  kernel8 每轮读入：1 次 float4 load → 4 次 fmaxf + 4 次 exp（Pass1+2）
+                    + 2 次 exp（合并公式中的缩放因子）
+
+  额外 exp 数量：每批 2 次（exp(m_A - new_max) 和 exp(m_B - new_max)）
+
+  代价评估：
+  · exp 是纯寄存器运算，约 20 cycle，无内存访问
+  · 省下的全局内存读取约 200~400 cycle（L2 未命中时）
+  · 对内存密集型的 softmax，省一次 HBM 读 >> 多几次 exp 的代价
+
+
+四、数据汇总
+------------
+
+| 对比项               | kernel7（3-pass）      | kernel8（online softmax）       |
+|----------------------|------------------------|---------------------------------|
+| 全局内存读次数       | 2 次                   | 1 次                            |
+| 全局内存写次数       | 1 次                   | 1 次                            |
+| warp 规约指令        | __shfl_down_sync       | __shfl_xor_sync（必须）         |
+| 每批额外 exp 运算    | 0                      | 2 次（缩放因子）                |
+| 性能瓶颈             | HBM 带宽               | HBM 带宽（减轻 50%）            |
+| 净效果               | 基准                   | 内存密集场景下显著更快          |
+
+
+五、与 kernel10（寄存器缓存）的横向对比
+-----------------------------------------
+
+kernel10 采用另一种思路减少全局内存读：
+  Pass1：读全局内存 + 将数据缓存到寄存器数组
+  Pass2：读寄存器数组（无全局内存访问）
+  Pass3：读寄存器数组 + 写全局内存
+
+| 方案                 | 全局内存读 | 全局内存写 | 额外代价                     |
+|----------------------|------------|------------|------------------------------|
+| kernel7（3-pass）    | 2 次       | 1 次       | 无                           |
+| kernel8（online）    | 1 次       | 1 次       | 每批 2 次额外 exp            |
+| kernel10（寄存器缓存）| 1 次      | 1 次       | 占用更多寄存器，限制 occupancy|
+
+online softmax 和寄存器缓存均将全局内存读降至 1 次，
+但实现方式不同：前者在计算层面合并，后者在存储层面缓存。
+
+
+六、Pass3 除法优化
+------------------
+
+kernel8 Pass3 预先计算 inv_divisor，将循环内 4 次除法改为 1 次除法 + 4 次乘法：
+
+  // 未优化：循环内每个元素各做一次除法
+  val.x = __expf(val.x - maxVar) / divisor;   // 4 次除法 / 迭代
+  val.y = __expf(val.y - maxVar) / divisor;
+  val.z = __expf(val.z - maxVar) / divisor;
+  val.w = __expf(val.w - maxVar) / divisor;
+
+  // 优化后：循环外 1 次除法，循环内 4 次乘法
+  scalar_t inv_divisor = scalar_t{1} / divisor;   // 1 次除法（循环外）
+  val.x = __expf(val.x - maxVar) * inv_divisor;   // 1 次乘法 / 元素
+  val.y = __expf(val.y - maxVar) * inv_divisor;
+  val.z = __expf(val.z - maxVar) * inv_divisor;
+  val.w = __expf(val.w - maxVar) * inv_divisor;
+
+代价分析：
+  · FP 除法：约 20 cycle（全精度倒数）
+  · FP 乘法：约 4 cycle
+  · 每迭代节省 3 次除法 ≈ 3 × (20−4) = 48 cycle
+  · 迭代次数越多（totalCol 越大），收益越显著
+
+
+七、warp 内在线规约的三种情况
+------------------------------
+
+warp 规约时，两个 lane 交换 (maxVar, divisor) 后需要合并为新的基准。
+设 maxVar_compare = fmaxf(自身, 对方)，分三种情况讨论：
+
+情况1：两端均有数据（maxVar ≠ -INFINITY，对方 ≠ -INFINITY）
+  maxVar_compare 为两端中较大的实数。
+  缩放因子 exp(maxVar - maxVar_compare) ≤ 1（非正指数），结果有界，无 NaN 风险。
+  不需要特殊处理。
+
+情况2：两端均无数据（maxVar == -INFINITY，对方 == -INFINITY）
+  maxVar_compare = fmaxf(-INF, -INF) = -INF
+  若直接计算：exp(-INF - (-INF)) = exp(NaN) = NaN，0 × NaN = NaN ← 必须处理
+
+  处理方式：检测到 maxVar_compare == -INFINITY 时将两端置 0：
+    maxVar = maxVar_compare = scalar_t{};   // 0 代替 -INF
+  则 exp(0 - 0) = 1，divisor = 0 × 1 = 0，结果正确。
+
+  【判断条件为何用 maxVar_compare == -INF 而非 maxVar == -INF】
+    maxVar_compare = fmaxf(自身, 对方)，只有当两端均为 -INF 时才等于 -INF。
+    若仅用 maxVar == -INF（即情况3中当前 lane 无数据），则会误触发——
+    此时对方为实数，maxVar_compare = 实数 ≠ -INF，分支不会触发；
+    实际上情况3的 exp(-INF - real) = 0，不产生 NaN，无需处理。
+    因此 maxVar_compare == -INF 精确对应情况2，判断条件正确。
+
+情况3：一端无数据（-INFINITY），另一端有数据（实数）
+  maxVar_compare = fmaxf(-INF, real) = real（≠ -INF，不触发情况2的 if 分支）
+  无数据端：exp(-INF - real) = exp(-∞) = 0，divisor_无数据 × 0 = 0，正确。
+  有数据端：exp(real - real) = 1，divisor_有数据 × 1 不变，正确。
+  无需特殊处理，exp 不产生 NaN。
+
+| 情况       | maxVar_compare | 是否触发 if | 结果   |
+|------------|----------------|-------------|--------|
+| 情况1      | 实数           | 否          | 正常缩放，无 NaN |
+| 情况2      | -INF           | 是（置 0）  | divisor=0，正确  |
+| 情况3      | 实数           | 否          | exp(−∞)=0，正确  |
+
+代码结构（规约循环主体）：
+
+  for (scalar_i i {16}; i >= 1; i /= 2) {
+      maxVar_compare = fmaxf(maxVar, __shfl_xor_sync(0xffffffff, maxVar, i, 32));
+      if (maxVar_compare == -std::numeric_limits<scalar_t>::infinity()) {  // 仅情况2触发
+          maxVar = maxVar_compare = scalar_t{};
+      }
+      divisor *= __expf(maxVar - maxVar_compare);
+      divisor += __shfl_xor_sync(0xffffffff, divisor, i, 32);
+      maxVar = maxVar_compare;
+  }
+
+具体数值示例（mask=16，lane0 与 lane16 交换）：
+
+  情况1：两端均有数据
+    lane0:  maxVar=2.0, divisor=1.5
+    lane16: maxVar=3.0, divisor=0.8
+
+    maxVar_compare = fmaxf(2.0, 3.0) = 3.0  → if 不触发
+    lane0:  divisor *= exp(2.0 - 3.0) = exp(-1) ≈ 0.368
+            divisor = 1.5 × 0.368 ≈ 0.552
+            divisor += 0.8（lane16 的值）→ 0.552 + 0.8 = 1.352
+            maxVar = 3.0
+    结果：(3.0, 1.352)，等价于将两批 exp 统一到基准 3.0 后求和 ✓
+
+  情况2：两端均为 -INF（对应未处理任何元素的线程）
+    lane0:  maxVar=-INF, divisor=0
+    lane16: maxVar=-INF, divisor=0
+
+    maxVar_compare = fmaxf(-INF, -INF) = -INF  → if 触发
+    maxVar = maxVar_compare = 0                 // 置 0，避免 exp(NaN)
+    divisor *= exp(0 - 0) = 1
+    divisor = 0 × 1 = 0
+    divisor += 0（lane16 的值）= 0
+    maxVar = 0
+    结果：(0, 0)，表示无有效数据，divisor=0 ✓
+
+    若不处理（if 被注释）：
+    divisor *= exp(-INF - (-INF)) = exp(NaN) = NaN
+    divisor = 0 × NaN = NaN  ← 污染后续所有计算
+
+  情况3：一端 -INF（无数据），另一端为实数
+    lane0:  maxVar=-INF, divisor=0
+    lane16: maxVar=2.0,  divisor=1.5
+
+    maxVar_compare = fmaxf(-INF, 2.0) = 2.0  → if 不触发（≠ -INF）
+    lane0:  divisor *= exp(-INF - 2.0) = exp(-∞) = 0
+            divisor = 0 × 0 = 0
+            divisor += 1.5（lane16 的值）= 1.5
+            maxVar = 2.0
+    结果：(2.0, 1.5)，lane16 的数据被正确保留 ✓
+
+
+八、主循环设计细节
+------------------
+
+1. 冗余分支删除（if (i == theadIDX) 初始化）
+
+  原始代码在首次迭代时用额外分支手动初始化 maxVar：
+
+    // 有冗余分支的版本
+    if (i == theadIDX) {        // 首次迭代才执行，后续迭代空跑
+        maxVar = maxVar_switch;
+        divisor = divisor_switch;
+    }
+    // 然后再执行合并公式...
+
+  删除原因：合并公式本身已能正确处理初始状态 maxVar = -INF（即情况3）。
+  追踪首次迭代（i == theadIDX，maxVar = -INF，divisor = 0）：
+
+    // 删除冗余分支后，直接执行合并公式
+    maxVar_compare = fmaxf(maxVar_switch, maxVar);              // fmaxf(m_B, -INF) = m_B
+    divisor_switch *= __expf(maxVar_switch - maxVar_compare);   // exp(m_B - m_B) = 1，不变
+    divisor        *= __expf(maxVar        - maxVar_compare);   // exp(-INF - m_B) = 0，清零
+    divisor += divisor_switch;   // 0 + divisor_switch = divisor_switch ✓
+    maxVar = maxVar_compare;     // maxVar = m_B ✓
+
+  结果与有分支版本完全一致，分支为冗余代码。
+
+
+2. 必须引入 maxVar_compare 的原因
+
+  合并两批数据时，需要同时使用三个值：
+    m_A      = maxVar        （历史最大值）
+    m_B      = maxVar_switch （当前批次最大值）
+    new_max  = max(m_A, m_B) （合并后基准）
+
+  错误写法：直接将 new_max 写回 maxVar_switch，m_B 被覆盖：
+
+    maxVar_switch = fmaxf(maxVar_switch, maxVar);            // maxVar_switch 被覆盖为 new_max，m_B 丢失
+    divisor_switch *= __expf(maxVar_switch - maxVar_switch); // exp(new_max - new_max) = 1 ← 错误，应为 exp(m_B - new_max)
+    divisor        *= __expf(maxVar        - maxVar_switch); // exp(m_A - new_max) ← 仍正确
+
+  正确写法：引入 maxVar_compare 单独保存 new_max，m_B 保持不变：
+
+    maxVar_compare = fmaxf(maxVar_switch, maxVar);             // new_max，不修改 maxVar_switch
+    divisor_switch *= __expf(maxVar_switch - maxVar_compare);  // exp(m_B - new_max) ← 正确
+    divisor        *= __expf(maxVar        - maxVar_compare);  // exp(m_A - new_max) ← 正确
+    divisor += divisor_switch;
+    maxVar = maxVar_compare;
+
+  数值对比（m_A=2.0, divisor_A=1.5，m_B=3.0, divisor_B=0.8，new_max=3.0）：
+
+    错误写法：
+      maxVar_switch = fmaxf(3.0, 2.0) = 3.0    ← m_B(3.0) 被 new_max(3.0) 覆盖（数值相同，巧合正确）
+      maxVar_switch = fmaxf(2.0, 3.0) = 3.0    ← m_B(2.0) 被 new_max(3.0) 覆盖（数值不同，结果错误）
+      divisor_switch *= exp(3.0 - 3.0) = 1     ← 应为 exp(2.0 - 3.0) = 0.368，错误！
+
+    正确写法：
+      maxVar_compare = fmaxf(2.0, 3.0) = 3.0   ← new_max，maxVar_switch 仍为 2.0
+      divisor_switch *= exp(2.0 - 3.0) = 0.368 ← exp(m_B - new_max)，正确 ✓
+      divisor        *= exp(3.0 - 3.0) = 1.0   ← exp(m_A - new_max)，正确 ✓（此处 m_A 恰为 new_max）

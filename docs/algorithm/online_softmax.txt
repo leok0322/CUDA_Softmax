@@ -1,0 +1,226 @@
+Online Softmax 算法
+===================
+
+
+一、标准 softmax 的问题
+-----------------------
+
+标准 softmax 需要 3 次遍历全局内存：
+
+  Pass1：遍历所有元素，求全局最大值 max
+  Pass2：遍历所有元素，求 sum = Σ exp(x_i - max)
+  Pass3：遍历所有元素，写出 softmax(x_i) = exp(x_i - max) / sum
+
+Pass1 和 Pass2 是两次独立的全局内存读取，无法合并——
+Pass2 需要 max，而 max 在 Pass1 结束前未知。
+
+Online softmax 的目标：将 Pass1 和 Pass2 合并为一次遍历。
+
+
+二、核心思想：维护 (max, sum) 对
+---------------------------------
+
+定义状态对 (m, d)，含义如下：
+  m = 当前已见元素的最大值
+  d = Σ exp(x_i - m)，以当前 m 为基准的 exp 之和
+
+关键性质：当 m 更新时，d 可以通过乘以缩放因子来修正，无需重新计算。
+
+设处理到第 k 个元素后：
+  m_k = max(x_0, ..., x_k)
+  d_k = Σ_{i=0}^{k} exp(x_i - m_k)
+
+当新元素 x_{k+1} 到来，m_{k+1} = max(m_k, x_{k+1})：
+
+  d_{k+1} = Σ_{i=0}^{k+1} exp(x_i - m_{k+1})
+           = Σ_{i=0}^{k} exp(x_i - m_k) * exp(m_k - m_{k+1})  +  exp(x_{k+1} - m_{k+1})
+           = d_k * exp(m_k - m_{k+1})  +  exp(x_{k+1} - m_{k+1})
+
+即：旧的 d 乘以缩放因子 exp(m_old - m_new)，再加上新元素的贡献。
+这个更新公式不依赖历史元素，只依赖旧的 (m, d) 对。
+
+【公式推广：新增的不是单个元素，而是一批元素】
+
+设新增一批元素，其局部状态为 (m_B, d_B)：
+  m_B = max(这批元素)
+  d_B = Σ_{j∈batch} exp(x_j - m_B)   ← 以批内最大值为基准的局部 sum
+
+推导：
+  m_new = max(m_k, m_B)
+
+  d_new = Σ_{i=0}^{k} exp(x_i - m_new)  +  Σ_{j∈batch} exp(x_j - m_new)
+
+  第一项（历史元素部分）：
+    Σ_{i=0}^{k} exp(x_i - m_new)
+    = Σ_{i=0}^{k} exp(x_i - m_k) * exp(m_k - m_new)   ← 凑出 d_k 的定义
+    = d_k * exp(m_k - m_new)
+
+  第二项（新批次元素部分）：
+    Σ_{j∈batch} exp(x_j - m_new)
+    = Σ_{j∈batch} exp(x_j - m_B) * exp(m_B - m_new)   ← 凑出 d_B 的定义
+    = d_B * exp(m_B - m_new)
+
+  合并：
+  d_new = d_k * exp(m_k - m_new)  +  d_B * exp(m_B - m_new)
+
+单元素公式是其特殊情况：单个元素的 d_B = 1，m_B = x_{k+1}，代入即还原原式。
+
+  | 情况         | 第一项                    | 第二项                        |
+  |--------------|---------------------------|-------------------------------|
+  | 新增单个元素 | d_k * exp(m_k - m_new)    | 1  * exp(x_{k+1} - m_new)    |
+  | 新增一批元素 | d_k * exp(m_k - m_new)    | d_B * exp(m_B - m_new)       |
+
+这正是四节并行规约中的 merge 操作——并行时每个线程先对自己负责的子集
+求出局部 (m_B, d_B)，再用上述公式与其他线程的状态合并。
+
+
+三、串行 online softmax 过程
+-----------------------------
+
+初始化：m = -INFINITY，d = 0
+
+对每个元素 x_i：
+  m_new = max(m, x_i)
+  d     = d * exp(m - m_new) + exp(x_i - m_new)
+  m     = m_new
+
+遍历结束后：m = 全局最大值，d = Σ exp(x_i - m)
+
+举例（x = [1, 3, 2]）：
+
+  初始：m = -inf，d = 0
+
+  i=0, x=1：
+    m_new = max(-inf, 1) = 1
+    d = 0 * exp(-inf - 1) + exp(1 - 1) = 0 + 1 = 1
+    m = 1
+
+  i=1, x=3：
+    m_new = max(1, 3) = 3
+    d = 1 * exp(1 - 3) + exp(3 - 3) = exp(-2) + 1 ≈ 0.135 + 1 = 1.135
+    m = 3
+
+  i=2, x=2：
+    m_new = max(3, 2) = 3（不变）
+    d = 1.135 * exp(3 - 3) + exp(2 - 3) = 1.135 * 1 + exp(-1) ≈ 1.135 + 0.368 = 1.503
+    m = 3
+
+  验证：
+    d = exp(1-3) + exp(3-3) + exp(2-3) = exp(-2) + 1 + exp(-1) ≈ 1.503 ✓
+
+
+四、并行规约：(m, d) 对的合并操作
+----------------------------------
+
+并行时，每个线程处理一部分元素，得到局部 (m_A, d_A) 和 (m_B, d_B)。
+合并两个状态对：
+
+  m = max(m_A, m_B)
+  d = d_A * exp(m_A - m) + d_B * exp(m_B - m)
+
+展开（假设 m_A >= m_B）：
+
+  m = m_A
+  d = d_A * exp(0) + d_B * exp(m_B - m_A)
+    = d_A + d_B * exp(m_B - m_A)
+
+此合并操作满足结合律，可用于树形规约。
+
+证明结合律：
+  merge(merge(A, B), C) == merge(A, merge(B, C))
+  两者都等于 (max(m_A,m_B,m_C), Σ exp(x_i - max))，顺序无关。
+
+
+五、warp 内并行规约（__shfl_xor_sync）
+---------------------------------------
+
+线程先串行遍历各自负责的元素，得到局部 (maxval, divisor)：
+
+  float maxval = -INFINITY, divisor = 0;
+  for (int i = ty; i < w/4; i += BLOCK_DIM_X) {
+      float4 val = load(&a[row*w + i*4]);
+      // 更新 maxval
+      if (val.x > maxval) { divisor *= exp(maxval - val.x); maxval = val.x; }
+      divisor += exp(val.x - maxval);
+      // 同理处理 val.y/z/w
+  }
+
+然后 warp 内用 __shfl_xor_sync 合并所有线程的 (maxval, divisor)：
+
+  for (int mask = 16; mask > 0; mask /= 2) {
+      float inc_max = __shfl_xor_sync(0xffffffff, maxval,  mask);
+      float inc_div = __shfl_xor_sync(0xffffffff, divisor, mask);
+      if (inc_max > maxval) {
+          divisor *= exp(maxval - inc_max);
+          maxval = inc_max;
+      } else {
+          inc_div *= exp(inc_max - maxval);
+      }
+      divisor += inc_div;
+  }
+
+【为什么必须用 __shfl_xor_sync，不能用 __shfl_down_sync】
+
+合并操作要求每步后参与交换的两个 lane 都持有更新的 (max, div)，
+供下一步继续使用：
+
+  __shfl_xor_sync（蝶形）：
+    lane0 ↔ lane2 互换 → lane0 和 lane2 都合并得到 (max(0,2), div(0,2)) ✓
+    下一步 lane0 ↔ lane1：lane0 用的是已合并的值 ✓
+
+  __shfl_down_sync（单向）：
+    lane0 读 lane2 → lane0 合并得到 (max(0,2), div(0,2)) ✓
+    lane2 读 lane4（越界）→ lane2 值不变，仍是旧的 (max2, div2) ✗
+    下一步 lane0 读 lane1 → lane1 读 lane2 的旧值 → 结果错误 ✗
+
+简单 max/sum 规约：只需 lane0 有最终结果 → down_sync 可用
+Online softmax 规约：每步两侧都需要更新后的状态 → 只能用 xor_sync
+
+
+六、kernel8 完整流程
+--------------------
+
+  // Pass1+2 融合：一次遍历同时求 max 和 sum
+  float maxval = 0, divisor = 0, old_maxval = 0;
+  for (int i = ty; i < w/4; i += BLOCK_DIM_X) {
+      float4 val = load(&a[row*w + i*4]);
+      // 更新 max，同时缩放 divisor
+      maxval = max(maxval, val.x/y/z/w);
+      if (maxval > old_maxval) {
+          divisor *= exp(old_maxval - maxval);
+          old_maxval = maxval;
+      }
+      divisor += exp(val.x - maxval) + exp(val.y - maxval) + ...;
+  }
+
+  // warp 内规约（xor_sync 合并 (max, div) 对）
+  for (int mask = 16; mask > 0; mask /= 2) { ... }
+
+  // 写回 smem，跨 warp 规约（同样用 xor_sync 合并对）
+  ...
+
+  // Pass3：写出结果（仍需一次全局内存写）
+  for (int i = ty; i < w/4; i += BLOCK_DIM_X) {
+      val.x = exp(val.x - maxval) / divisor;
+      reinterpret_cast<float4*>(&b[row*w + i*4])[0] = val;
+  }
+
+全局内存访问：Pass1+2 合并为 1 次读 + Pass3 的 1 次写 = 2 次（标准 3-pass 需要 3 次读 + 1 次写）
+
+
+七、与 kernel10 的对比
+-----------------------
+
+kernel10 用寄存器数组缓存 Pass1 的数据，也减少了全局内存读取：
+  Pass1：读全局内存 + 存入寄存器数组
+  Pass2：读寄存器数组（无全局内存访问）
+  Pass3：读寄存器数组 + 写全局内存
+
+  | 方案            | 全局内存读 | 全局内存写 | 额外代价              |
+  |-----------------|------------|------------|-----------------------|
+  | 标准 3-pass     | 3 次       | 1 次       | 无                    |
+  | online（kernel8）| 1 次      | 1 次       | 每步多 1 次 exp 运算  |
+  | 寄存器缓存(k10) | 1 次       | 1 次       | 占用更多寄存器        |
+
+online softmax 的代价：每次更新 max 时需要额外计算 exp(old_max - new_max) 来缩放 divisor，
+增加了 exp 运算次数，但消除了一次全局内存读取，对内存密集型的 softmax 整体有收益。

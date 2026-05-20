@@ -58,8 +58,38 @@ T __shfl_down_sync(unsigned mask, T var, unsigned delta, int width=32)
 
 原理：
   lane k 读取 lane k+delta 的值（单向，高索引→低索引）。
-  当 k+delta >= width 时，lane k 收到自身的值（或行为未定义，建议避免）。
+  当 k+delta >= width 时，源 lane 越界，lane k 收到自身的值（返回自身寄存器中的 var）。
   5步后只有 lane 0 持有全局规约结果，其余 lane 值无意义。
+
+【越界时返回自身值的含义】
+
+  以 delta=16、width=32 为例，高 lane（lane 16~31）全部越界：
+
+    lane 16：源 = 16+16 = 32 ≥ 32（越界）→ 读自身 → 返回 lane16 自身的 var
+    lane 17：源 = 17+16 = 33 ≥ 32（越界）→ 读自身 → 返回 lane17 自身的 var
+    ...
+    lane 31：源 = 31+16 = 47 ≥ 32（越界）→ 读自身 → 返回 lane31 自身的 var
+
+  低 lane（lane 0~15）正常读到对应高 lane 的值：
+
+    lane 0：源 = 0+16 = 16 → 读 lane16 的 var（正常）
+    lane 1：源 = 1+16 = 17 → 读 lane17 的 var（正常）
+
+  结果：低 lane 得到高 lane 的值，高 lane 得到自身的值（等价于 no-op）。
+
+【对 online softmax 规约的影响】
+
+  online softmax 规约中，高 lane 的 maxVar_compare 由此变为：
+    maxVar_compare = fmaxf(maxVar, __shfl_down_sync(..., maxVar, delta, 32))
+                   = fmaxf(m_高,   m_高)          ← 越界，拿到自身值
+                   = m_高                          ← 看不到低 lane 的 max
+
+  高 lane 随后执行缩放：
+    divisor *= exp(m_高 - m_高) = 1               ← 完全不缩放
+
+  低 lane 读到高 lane 未缩放的 divisor，当低 lane max > 高 lane max 时结果错误。
+  这正是 online softmax 规约必须用 xor_sync 而非 down_sync 的根本原因。
+  （简单 max/sum 规约不需要缩放，down_sync 仍然可用。）
 
 用法示例：
   // 求 warp 内所有 lane 的最大值，结果只在 lane 0

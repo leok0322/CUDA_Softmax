@@ -18,3 +18,5 @@ void run_softmax_kernel_vectorize(uint totalRow, uint totalCol, float* A, float*
 void run_softmax_kernel_threadNum1024_double_warp_tree_reduction(uint totalRow, uint totalCol, float* A, float* out);
 
 void run_softmax_kernel_using_shfl_down_sync_and_unroll(uint totalRow, uint totalCol, float* A, float* out);
+
+void run_softmax_kernel_using_online_softmax(uint totalRow, uint totalCol, float* A, float* out);

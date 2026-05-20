@@ -274,3 +274,88 @@
   // 可以部分展开：#pragma unroll N，N 是编译期常数，循环总次数可以是运行期值
   #pragma unroll 4
   for (int i = 0; i < w; i++) { ... }
+
+
+七、含跨迭代依赖的循环：#pragma unroll URF 仍有效
+--------------------------------------------------
+
+online softmax 主循环存在跨迭代的状态依赖链，展开不影响其正确性，
+但 ILP 收益受限，主要收益来自 MLP 和循环控制开销。
+
+【代码】
+
+  #pragma unroll URF   // URF = 4，部分展开
+  for (scalar_i i {theadIDX}; i < totalCol / 4; i+=threadNum) {
+    scalar_t4 vecA { reinterpret_cast<scalar_t4*>(&a[(initRow + row) * totalCol + i * 4])[0] };
+    maxVar_switch = fmaxf(maxVar_switch, vecA.x);
+    maxVar_switch = fmaxf(maxVar_switch, vecA.y);
+    maxVar_switch = fmaxf(maxVar_switch, vecA.z);
+    maxVar_switch = fmaxf(maxVar_switch, vecA.w);
+
+    divisor_switch += __expf(vecA.x - maxVar_switch);
+    divisor_switch += __expf(vecA.y - maxVar_switch);
+    divisor_switch += __expf(vecA.z - maxVar_switch);
+    divisor_switch += __expf(vecA.w - maxVar_switch);
+
+    maxVar_compare = fmaxf(maxVar_switch, maxVar);
+    divisor_switch *= __expf(maxVar_switch - maxVar_compare);  // exp(m_B - new_max)
+    divisor        *= __expf(maxVar        - maxVar_compare);  // exp(m_A - new_max)
+    divisor += divisor_switch;
+    maxVar = maxVar_compare;
+    divisor_switch = scalar_t{};
+    maxVar_switch = -std::numeric_limits<scalar_t>::infinity();
+  }
+
+【跨迭代依赖链分析】
+
+  以下变量在迭代间携带状态，前一轮的输出是下一轮的输入：
+
+    maxVar        → 下一轮合并公式的 m_A
+    divisor       → 下一轮合并公式的历史 exp 之和
+    maxVar_switch → 每轮末尾重置为 -INF，本轮重新从 -INF 开始累积
+    divisor_switch→ 每轮末尾重置为 0，本轮重新从 0 开始累积
+
+  关键依赖（伪代码，i0/i1 表示相邻两次宏观迭代）：
+
+    // 迭代 i0
+    maxVar_compare_i0 = fmaxf(maxVar_switch_i0, maxVar_i0)
+    maxVar_i1         = maxVar_compare_i0          ← maxVar 被更新
+
+    // 迭代 i1 必须等 maxVar_i1 就绪
+    maxVar_compare_i1 = fmaxf(maxVar_switch_i1, maxVar_i1)
+    divisor_i1        = ...  * __expf(maxVar_i1 - maxVar_compare_i1)
+
+  结论：相邻迭代之间存在 RAW（Read-After-Write）依赖，
+  展开无法将相邻迭代的计算并行执行。
+
+【展开后各份之间的独立性：load 可并行】
+
+  展开将循环体复制 4 份，每份的 load 地址相差 threadNum * 4 个 float：
+
+    // 第1份
+    vecA_0 = load(&a[... + (theadIDX              ) * 4])
+    // 第2份
+    vecA_1 = load(&a[... + (theadIDX +   threadNum) * 4])
+    // 第3份
+    vecA_2 = load(&a[... + (theadIDX + 2*threadNum) * 4])
+    // 第4份
+    vecA_3 = load(&a[... + (theadIDX + 3*threadNum) * 4])
+
+  4 个 load 地址完全独立，编译器可以在第 1 份 load 等待期间
+  提前发射第 2、3、4 份的 load → MLP（内存级并行）。
+
+  但 4 份之间的 maxVar / divisor 更新存在串行链：
+    第2份的 divisor *= exp(maxVar - ...) 依赖第1份更新后的 maxVar。
+  因此 fmaxf / expf 计算部分无法跨份并行（ILP 受限）。
+
+【收益汇总】
+
+  | 收益类型         | 是否有效 | 说明                                   |
+  |------------------|----------|----------------------------------------|
+  | MLP（load 并行） | 有效     | 4 份 load 独立，可同时在途             |
+  | ILP（计算并行）  | 受限     | fmaxf/expf 依赖跨份 maxVar，串行执行   |
+  | 循环控制开销     | 有效     | branch + counter 指令减少 4 倍         |
+  | 正确性           | 保证     | 展开不改变执行顺序，依赖链完整保留     |
+
+  跨迭代依赖不会阻止展开本身（展开只是代码复制），
+  也不影响 load 的 MLP，只是限制了 fmaxf/expf 的 ILP 收益。
