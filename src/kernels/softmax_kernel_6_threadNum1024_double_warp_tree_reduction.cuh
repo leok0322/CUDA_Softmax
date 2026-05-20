@@ -6,6 +6,16 @@
 #define BLOCK_DIM_X 1024
 #endif
 
+
+#ifndef UNROLL_FACTOR
+#define UNROLL_FACTOR 4
+#endif
+
+#ifndef URF_DEFINED
+#define URF_DEFINED
+constexpr int URF {UNROLL_FACTOR};
+#endif
+
 template <typename scalar_t>
 __global__ void softmax_kernel_6(scalar_t* __restrict__ a, scalar_t* __restrict__ b, int w, int h)
 {

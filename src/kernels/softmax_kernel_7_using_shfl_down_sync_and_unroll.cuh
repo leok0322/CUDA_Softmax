@@ -7,10 +7,13 @@
 #define BLOCK_DIM_X 1024
 #endif
 
+#ifndef UNROLL_FACTOR
+#define UNROLL_FACTOR 4
+#endif
 
 #ifndef URF_DEFINED
 #define URF_DEFINED
-constexpr int URF {4};
+constexpr int URF {UNROLL_FACTOR};
 #endif
 
 

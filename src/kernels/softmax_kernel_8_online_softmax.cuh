@@ -29,9 +29,13 @@
 //     第一个被包含的头文件定义 URF 并设置宏标志 URF_DEFINED，
 //     后续头文件检测到标志已存在则跳过定义，避免重复。
 // ────────────────────────────────────────────────────────────────────────────
+#ifndef UNROLL_FACTOR
+#define UNROLL_FACTOR 4
+#endif
+
 #ifndef URF_DEFINED
 #define URF_DEFINED
-constexpr int URF {4};
+constexpr int URF {UNROLL_FACTOR};
 #endif
 
 
