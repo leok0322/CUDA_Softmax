@@ -65,16 +65,22 @@
       ...
   }
 
-编译器将循环体复制 4 份，步长变为 BLOCK_DIM_X*4：
-  // 第1份：i = ty
-  float4 val1 = load(&a[row*w + ty*4]);        maxval = fmaxf(...);
-  // 第2份：i = ty + BLOCK_DIM_X
-  float4 val2 = load(&a[row*w + (ty+1024)*4]); maxval = fmaxf(...);
-  // 第3份：i = ty + BLOCK_DIM_X*2
-  float4 val3 = load(&a[row*w + (ty+2048)*4]); maxval = fmaxf(...);
-  // 第4份：i = ty + BLOCK_DIM_X*3
-  float4 val4 = load(&a[row*w + (ty+3072)*4]); maxval = fmaxf(...);
-  // 剩余不足4份的迭代走原始循环
+部分展开是跨步展开：循环体复制 4 份，步长扩大为 4*BLOCK_DIM_X，
+外层循环仍然存在，每次宏观迭代处理 4 份数据。
+若总迭代数不是 4 的整数倍，编译器在主循环后附加余数循环（epilogue）。
+
+等价伪代码（循环仍在，步长变大）：
+  for (int i = ty; i < w/4; i += 4*BLOCK_DIM_X) {
+      // 第1份：i
+      float4 val1 = load(&a[row*w + i*4]);           maxval = fmaxf(...);
+      // 第2份：i + BLOCK_DIM_X
+      float4 val2 = load(&a[row*w + (i+1024)*4]);    maxval = fmaxf(...);
+      // 第3份：i + BLOCK_DIM_X*2
+      float4 val3 = load(&a[row*w + (i+2048)*4]);    maxval = fmaxf(...);
+      // 第4份：i + BLOCK_DIM_X*3
+      float4 val4 = load(&a[row*w + (i+3072)*4]);    maxval = fmaxf(...);
+  }
+  // epilogue：处理余数（不足4份的迭代）
 
 效果：
   · branch 次数降为 1/4
@@ -200,22 +206,34 @@
 4 个 load 地址相差 threadNum*4 个 float（= 4096 字节，BLOCK_DIM_X=1024时），
 属于 4 条完全不同的 cache line，互相独立。
 
-【三个提升 GFLOPS 的原因】
+【关于"分组 load"与"交替 load/fmaxf"的本质区别】
 
-1. MLP（内存级并行，occupancy 低时有效）
+  不展开时是 load→fmaxf→load→fmaxf 交替；展开后是 load×4→fmaxf×16 分组。
+  fmaxf 依赖 load 结果（RAW），无论哪种模式都必须等 load 返回才能执行，
+  load 和 fmaxf 使用不同执行单元这一事实对此没有帮助。
+
+  但两种模式在 GPU 上的实际差异取决于 TLP（occupancy）：
+
+  高 TLP 时（活跃 warp 足够多）：
+    warp A: issue load[i0] → stall → 切换 warp B → warp B 也 issue load → ...
+    内存控制器始终有来自多个 warp 的并发请求，带宽已饱和。
+    此时"交替"与"分组"对带宽的影响相同——两种模式下 TLP 都提供了足够的 MLP。
+    展开的收益仅剩减少 branch/counter 指令开销。
+
+  低 TLP 时（活跃 warp 少）：
+    不展开：每次只有 1 个 load 在途，等待→执行→等待→执行，4次独立等待。
+    展开：4 个 load 同时在途，只有 1 次有效等待，后续 load 在等待期间已返回。
+    → 展开的 MLP 在此时才有本质收益，补偿 TLP 的不足。
+
+【提升 GFLOPS 的原因（按条件分类）】
+
+1. MLP（occupancy 低时有效）
    以 warp 为单位：4 次展开 × 32 线程 × 16 bytes = 2048 bytes = 16 条 cache line
-   同时在途，内存控制器并行处理。
-   注意：合并访问（coalesced）已保证 cache line 利用率 100%，
-         MLP 解决的是"并发请求数不足"而非"字节利用率"问题。
-   当 occupancy 足够高时，TLP（warp 切换）已饱和带宽，MLP 无额外收益。
+   同时在途，内存控制器并行处理，带宽从不足升向峰值。
+   高 occupancy 时 TLP 已饱和带宽，展开的 MLP 无额外收益。
 
-2. ILP + 延迟隐藏（始终有效）
-   编译器将 4 条 load 集中提前发射，在等待 load 返回期间执行已返回数据的 fmaxf，
-   计算填满内存等待窗口（全局内存延迟 ~200-400 cycles）。
-
-3. 减少循环控制开销（始终有效）
-   每次宏观迭代处理 4 份数据，branch + counter 指令减少 4 倍，
-   释放出的 issue slot 全部给 FMA。
+2. 减少循环控制开销（始终有效）
+   branch + counter 指令减少 4 倍，释放 issue slot 给有效计算。
 
 【不提升的指标】
 

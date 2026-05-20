@@ -85,7 +85,57 @@ TLP 是线程级并行，不是指令级并行（ILP）。
       但不保证 MLP——合并访问解决的是"字节是否浪费"，MLP 解决的是"请求是否足够并发"。
 
 
-六、三者的关系
+六、TLP 与 ILP 的关系
+---------------------
+
+【相同原则，不同实现】
+
+  TLP 和 ILP 都是延迟隐藏的手段，核心原则相同：
+    用其他有用的工作填充等待窗口，避免执行单元空转。
+
+  实现方式不同：
+
+  TLP（切换 warp）：
+    warp A: issue load → stall
+             ↓ 切换
+    warp B: 执行指令  ← 填充等待窗口
+    warp C: 执行指令
+             ↓ 轮回
+    warp A: load 已回来，继续执行
+    填充者 = 其他 warp 的指令流，stall 期间执行单元不空转。
+
+  ILP（同一 warp 内独立指令）：
+    warp A: issue load[0] → issue load[1] → issue load[2] → issue load[3]
+            （独立指令连续发射，不等 load[0] 返回）
+            → stall（等 load[0] 结果）
+    填充者 = 同一 warp 内的独立指令（发射阶段填充），
+            stall 本身仍然存在，stall 期间仍需 TLP 填充执行单元。
+
+  关键区别：
+    · TLP：stall 期间执行单元继续工作（跑其他 warp），完全隐藏延迟
+    · ILP：减少 stall 次数 + 增加并发内存请求（MLP），但 stall 本身未消除
+
+【高 TLP 是否意味着高 ILP？】
+
+  不是。两者独立：
+  · TLP：不同 warp 之间切换，warp 调度器负责
+  · ILP：同一 warp 内独立指令，编译器/硬件负责
+  一个 warp 内全是串行依赖链（如 fmaxf 规约）→ ILP = 0，TLP 可以很高。
+
+【高 TLP 时 ILP 的作用】
+
+  TLP 已通过 warp 切换充分隐藏延迟，ILP 对延迟隐藏的额外贡献很小。
+  低 TLP 时，ILP 发出更多并发请求（MLP），成为补充手段。
+
+  两者叠加效果最优：ILP 让每个 warp 发出更多请求，TLP 在 stall 时填充执行单元。
+
+  正确推论：
+    高 TLP → 延迟隐藏 ✓（warp 切换，执行单元不空转）
+    高 TLP → 高 ILP   ✗（两者独立）
+    高 TLP → ILP 贡献减小 ✓（TLP 已覆盖延迟）
+
+
+七、TLP 和 MLP 的关系
 --------------
 
 TLP 是 GPU 上 MLP 的主要来源：
@@ -115,7 +165,7 @@ TLP 是 GPU 上 MLP 的主要来源：
   #pragma unroll 的 MLP 补偿了 TLP 的不足。
 
 
-七、数值示例（softmax kernel，BLOCK_DIM_X=1024）
+八、数值示例（softmax kernel，BLOCK_DIM_X=1024）
 -------------------------------------------------
 
 设 SM 最多支持 32 个活跃 warp，目标：16 组并发请求饱和带宽。
@@ -132,7 +182,7 @@ TLP 是 GPU 上 MLP 的主要来源：
 以 warp 为单位：展开4次 → 32线程 × 4次 × 16bytes = 2048bytes = 16条cache line同时在途。
 
 
-八、总结
+九、总结
 --------
 
   | 指标  | 来源                    | 作用                           |
