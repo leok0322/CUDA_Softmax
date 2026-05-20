@@ -52,9 +52,22 @@ kernel6：两级规约
    · kernel6 Level 2：1 次 smem 读 + 5 次 shuffle + 1 次 smem 写
    · 延迟对比：kernel5 约 400-600 cycles vs kernel6 约 65-95 cycles
 
-3. 每步活跃线程更多
-   · kernel5 树形规约：每步活跃线程减半（512→256→...→1），多数线程空转等待 syncthreads
-   · kernel6 Level 2：warp0 的 32 个 lane 全程并行执行每步 shuffle，无线程空转
+【"活跃线程减半"不是独立原因】
+
+kernel5 中 `if (ty < stride)` 是谓词执行（predicated execution）：
+
+  · warp 内：SIMT 下 32 个 lane 在同一时钟周期并行执行。
+             predicated-out 的 lane 确实浪费了计算资源（执行指令但结果被丢弃，
+             useful FLOP 效率降低），但不增加额外执行时间——
+             32 个 lane 无论有多少真正活跃，都在相同的 cycles 内完成。
+             并行执行本身消化了这种浪费，不构成独立的时间代价。
+
+
+真正的性能损耗完全由上述第 1、2 点覆盖：
+  · 第1点：__syncthreads() 屏障强制全 block 同步，所有 warp 必须到齐，这是真正的时间代价
+  · 第2点：smem 访问延迟远高于 shuffle，无论活跃线程多少这个差距都存在
+
+"活跃线程少"只是 syncthreads 次数多的表现形式，不是独立的性能因子。
 
 
 三、数据汇总
@@ -65,7 +78,6 @@ kernel6：两级规约
 | syncthreads / pass      | 10 次          | 2 次               |
 | smem 读写 / pass        | 各 10 次       | 各 1 次            |
 | Level 2 操作对象        | shared memory  | 寄存器（shuffle）  |
-| Level 2 每步活跃线程    | 逐步减半       | 32 lane 全程并行   |
 | Level 2 延迟估算        | ~400-600 cycle | ~65-95 cycle       |
 
 

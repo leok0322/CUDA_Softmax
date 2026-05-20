@@ -1,0 +1,86 @@
+kernel5 (softmax_kernel_vectorize) vs kernel4：GFLOPS 提升原因分析
+====================================================================
+
+
+一、实现对比
+------------
+
+kernel4（softmax_kernel_4）：
+  · HBM 加载：scalar float（每条 load 指令 4 bytes/thread）
+  · Level 1：warp 内 __shfl_xor_sync 规约（5步，无 syncthreads）
+  · Level 2：warp0 再次 shuffle（5步，无 syncthreads），共 2 次 __syncthreads/pass
+
+kernel5（softmax_kernel_vectorize）：
+  · HBM 加载：float4 向量化（每条 load 指令 16 bytes/thread）
+  · Level 1：warp 内 __shfl_xor_sync 规约（5步，无 syncthreads）—— 与 kernel4 相同
+  · Level 2：smem 树形规约（对 32 个 warp 结果，reducNum/2=16 开始，5步）
+             + 1 次 __syncthreads（写入前）+ 5 次 __syncthreads（树形内）= 6 次/pass
+
+| 层级      | kernel4                    | kernel5                      |
+|-----------|----------------------------|------------------------------|
+| HBM load  | scalar float（4B/指令）    | float4（16B/指令）           |
+| Level 1   | warp shuffle（相同）       | warp shuffle（相同）         |
+| Level 2   | warp0 再次 shuffle（0 sync）| smem 树形规约（5 sync）     |
+| sync/pass | 2 次                       | 6 次                         |
+
+
+二、float4 向量化的收益
+------------------------
+
+根本原因：每条 load 指令传输 16 bytes（float4）而非 4 bytes（float），
+相同数据量下 load 指令数变为 1/4，所有收益均由此派生。
+
+1. load 指令减少 → issue slot 空出 → 更多 FMA 发射 → 流水线掩盖 load 延迟
+   · load 指令减少到 1/4，调度器 issue slot 空出
+   · 空出的 slot 由 FMA 指令填充，计算流水线更满
+   · FMA 的执行掩盖了 load 的内存延迟
+
+2. 循环次数减少 → 循环开销降低
+   · 迭代次数变为 1/4（totalCol/4 次代替 totalCol 次）
+   · branch 判断、loop counter 更新的指令开销相应降低
+   · 地址计算（AGEN）次数减少到 1/4
+
+3. 每条 load 返回 4 个 float 同时就绪
+   · 一条 float4 load 完成后，vecA.x / .y / .z / .w 同时在寄存器中可用
+   · 后续 4 次 fmaxf/expf 可立即连续发射，无需等待下一条 load
+   · 本质：每条 load 指令的数据吞吐量是 4×，不是增加了并发 load 请求数（MLP 不变）
+
+   对比（每次循环迭代）：
+     不向量化：issue load[i] → 等待 → fmaxf → issue load[i+1] → 等待 → fmaxf → ...
+     float4：  issue ld.v4[i] → 等待 → fmaxf×4 → issue ld.v4[i+4] → ...
+     向量化后：1次等待换来4次有效计算，效率提升
+
+   【第1、2、3点的关系】
+
+   三点均由同一个根本原因派生：每条 load 指令传输 16 bytes（float4）而非 4 bytes（float）。
+
+     第1点（issue slot 空出 → 更多 FMA）：
+       描述的是"load 指令数减少"对指令调度的影响——
+       相同数据量只需 1/4 的 load 指令，调度器空出的 slot 由 FMA 填充，
+       FMA 流水线更满，从而掩盖 load 延迟。
+
+     第2点（循环次数 ÷4）：
+       描述的是"迭代次数减少"对循环控制开销的影响——
+       branch 判断、counter 更新、地址计算（AGEN）指令减少到 1/4。
+
+     第3点（更多数据同时 ready）：
+       描述的是"单次 load 返回的数据量"——
+       1 次等待结束后 4 个 float 同时就绪，后续 4 次 fmaxf/expf 立即可发射；
+       标量 float 每次等待只得到 1 个 float，下一个 float 还需再等下一条 load 返回。
+
+   三点是同一改变（load 宽度 ×4）在不同维度上的体现，不是三个独立优化。
+
+
+三、数据汇总
+------------
+
+以 totalCol=1024，BLOCK_DIM_X=1024 为例：
+
+| 对比项                | kernel4         | kernel5              |
+|-----------------------|-----------------|----------------------|
+| 主循环 load 指令/pass | 1024 条         | 256 条（÷4）         |
+| 主循环迭代次数/pass   | 1024 次         | 256 次（÷4）         |
+| Level 2 syncthreads   | 0 次（shuffle） | 5 次（smem 树形）    |
+| 总 syncthreads/pass   | 2 次            | 6 次                 |
+| 核心收益              | —               | load 指令数 ÷4       |
+| 净效果                | 基准            | 显著更快（÷4 load 主导）|

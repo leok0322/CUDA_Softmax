@@ -1,0 +1,87 @@
+kernel4 vs kernel2：GFLOPS 提升原因分析
+==========================================
+
+
+一、规约方式对比
+----------------
+
+kernel2：对全 block 1024 个线程做纯 smem 树形规约
+
+  smem 大小：BLOCK_DIM_X = 1024 槽
+  规约过程（每 pass）：
+    reduction[ty] = local_maxval;           // 写 smem（1024次）
+    for stride = 512, 256, ..., 1:         // log₂(1024) = 10 步
+        __syncthreads();
+        if (ty < stride):
+            reduction[ty] = fmaxf(reduction[ty], reduction[ty+stride]);
+    __syncthreads();
+    maxval = reduction[0];
+  · 10 次 __syncthreads() + 1 次 = 11 次/pass
+  · smem 读写：每步 1 读 + 1 写 = 10 读 + 10 写/pass
+
+
+kernel4：两级规约（warp shuffle + 少量 smem）
+
+  smem 大小：BLOCK_DIM_X/32 = 32 槽
+
+  Level 1：warp 内 __shfl_xor_sync 规约（5步，无 syncthreads）
+    for mask = 16, 8, 4, 2, 1:
+        maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffff, maxval, mask, 32));
+    → warp 内所有 32 个 lane 均持有本 warp 最大值（寄存器操作，无 smem 访问）
+
+  Level 2：warp0 再次 shuffle（5步，无 syncthreads）
+    warp0 lane_ty 读 reduction[ty]（各 warp 结果）
+    for mask = 16, 8, 4, 2, 1:
+        maxval = fmaxf(maxval, __shfl_xor_sync(0xffffffff, maxval, mask, 32));
+    → warp0 所有 lane 均持有全局最大值
+
+  smem 仅用于 Level1→Level2 的数据传递：
+    · 1 次 smem 写（lane0 写 warp 结果，共 32 次写）
+    · 1 次 __syncthreads()（确保 warp0 读到所有 warp 的结果）
+    · 1 次 smem 写（lane0 写最终结果到 reduction[0]）
+    · 1 次 __syncthreads()（广播给全 block）
+  共 2 次 __syncthreads()/pass，smem 读写各 1 次/pass
+
+
+二、GFLOPS 提升原因
+--------------------
+
+1. __syncthreads() 大幅减少
+   · kernel2：11 次/pass × 2 pass = 22 次（pass3 无规约）
+   · kernel4： 2 次/pass × 2 pass =  4 次
+   每次 __syncthreads() 是全 block 屏障，所有 warp 必须到齐才能继续。
+   屏障等待直接占用执行时间，减少屏障次数即减少等待开销。
+
+2. smem 访问替换为寄存器 shuffle
+   · smem 访问延迟：~20-30 cycles / 次
+   · __shfl_xor_sync 延迟：~4-5 cycles / 次（专用寄存器交换硬件）
+   · kernel2：10 读 + 10 写 = 20 次 smem 访问/pass → 约 400-600 cycles
+   · kernel4：Level1 全为 shuffle（0 smem），Level2 仅 1 次 smem 读 + 1 次写 → 约 65-95 cycles
+   规约延迟降低约 5-8×。
+
+3. smem 占用减少，occupancy 可能提升
+   · kernel2：1024 × 4 = 4096 字节/block
+   · kernel4：32 × 4 = 128 字节/block
+   smem 减少意味着同一 SM 上可以驻留更多 block，活跃 warp 数增加，
+   TLP 提升 → 更好地掩盖内存延迟。
+
+
+三、数据汇总
+------------
+
+| 对比项                  | kernel2         | kernel4            |
+|-------------------------|-----------------|--------------------|
+| 规约方式                | 纯 smem 树形    | warp shuffle + smem|
+| smem 大小               | 4096 字节       | 128 字节           |
+| syncthreads / pass      | 11 次           | 2 次               |
+| smem 读写 / pass        | 各 10 次        | 各 1 次            |
+| 规约延迟估算            | ~400-600 cycle  | ~65-95 cycle       |
+
+
+四、前提条件
+------------
+
+kernel4 的两级规约要求 BLOCK_DIM_X = 1024：
+  · Level 1：每个 warp 32 线程内 shuffle 规约，产生 1 个 warp 结果
+  · Level 2：共 1024/32 = 32 个 warp 结果，恰好装满 warp0 的 32 个 lane
+  · 若 BLOCK_DIM_X != 1024，warp 数不为 32，warp0 一次 shuffle 无法覆盖全部结果
