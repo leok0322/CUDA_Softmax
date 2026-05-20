@@ -435,14 +435,34 @@ endif()
 #   即：target_compile_definitions 本身在配置阶段执行（写 build.ninja），
 #       对 kernels.cu 的实际影响发生在编译阶段的预处理器步骤，两者不在同一阶段
 #
-#   作用范围：对 softmax_cuda 的所有源文件生效（add_library 列出的每个文件）
-#     g++  src/interface.cpp             ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
-#     nvcc src/kernels.cu                ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
-#     nvcc src/kernels/softmax_kernel.cu ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
-#   各文件实际用到的宏：
-#     interface.cpp             : 只用 TORCH_EXTENSION_NAME（PYBIND11_MODULE 展开时用）
-#     kernels.cu                : 用 BLOCK_DIM_Y / UNROLL_FACTOR / SOFTMAX_VARIANT / WIDTH
-#     kernels/softmax_kernel.cu : 同 kernels.cu，多余的宏传入后编译器忽略未使用的定义
+#   ── 宏的作用范围 ──────────────────────────────────────────────────────────────
+#
+#   target_compile_definitions(softmax_cuda PRIVATE ...) 只对 softmax_cuda target
+#   的直接编译单元（.cpp / .cu）生效：
+#
+#     g++  src/interface.cpp    → 收到所有 -D，只实际用到 TORCH_EXTENSION_NAME
+#     nvcc src/run_kernels.cu   → 收到所有 -D，实际用到见下表
+#
+#   src/kernels/ 下的 .cuh 头文件不是编译单元，本身不收到任何 -D；
+#   预处理器先将 #include 展开，把 .cuh 内容文本合并进 run_kernels.cu，
+#   之后编译器处理合并后的翻译单元，-D 对整个翻译单元生效，.cuh 中的宏由此可用。
+#
+#   【各宏在源文件中的实际使用情况】
+#
+#   宏名                  interface.cpp   run_kernels.cu  说明
+#   ─────────────────────────────────────────────────────────────────────────────
+#   TORCH_EXTENSION_NAME  ✓ 使用          ✗ 不用         PYBIND11_MODULE 展开时用
+#   SOFTMAX_VARIANT       ✗ 不用          ✓ 使用         #if SOFTMAX_VARIANT==N 选择 kernel
+#   BLOCK_DIM_Y           ✗ 不用          ✓ 使用         kernel1~6 的 block.y 维线程数；
+#                                                         kernel7/8/10 用各自 .cuh 内部的
+#                                                         #ifndef BLOCK_DIM_X 定义，
+#                                                         不依赖此处注入的 BLOCK_DIM_Y
+#   UNROLL_FACTOR         ✗ 不用          ✓ 使用         kernel7+ 的循环展开因子
+#   WIDTH                 ✗ 不用          ✓ 使用         kernel10 的静态行宽提示
+#
+#   【validation target 不继承这些宏】
+#   validation 是独立的 add_executable target，有自己的 target_compile_definitions
+#   （或没有），与 softmax_cuda 的 PRIVATE 定义完全隔离，不会收到上述任何 -D。
 #
 #   与 add_compile_options 的区别：
 #     add_compile_options        : 对所有 target 全局生效

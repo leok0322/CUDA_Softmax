@@ -451,9 +451,34 @@ CMakeLists.txt 完整解析
 
   将宏定义注入编译命令，等价于给编译器追加 -D<宏名>=<值>。
 
+  只对 softmax_cuda target 的直接编译单元（.cpp / .cu）生效：
+    g++  src/interface.cpp    → 收到所有 -D，只实际用到 TORCH_EXTENSION_NAME
+    nvcc src/run_kernels.cu   → 收到所有 -D，实际用到见下表
+
+  src/kernels/ 下的 .cuh 头文件不是编译单元，本身不收到任何 -D；
+  预处理器先将 #include 展开，把 .cuh 内容文本合并进 run_kernels.cu，
+  之后编译器处理合并后的翻译单元，-D 对整个翻译单元生效，.cuh 中的宏由此可用。
+
+  【各宏在源文件中的实际使用情况】
+
+  宏名                  interface.cpp   run_kernels.cu  说明
+  ─────────────────────────────────────────────────────────────────────────────
+  TORCH_EXTENSION_NAME  ✓ 使用          ✗ 不用         PYBIND11_MODULE 展开时用
+  SOFTMAX_VARIANT       ✗ 不用          ✓ 使用         #if SOFTMAX_VARIANT==N 选择 kernel
+  BLOCK_DIM_Y           ✗ 不用          ✓ 使用         kernel1~6 的 block.y 维线程数；
+                                                        kernel7/8/10 用各自 .cuh 内部的
+                                                        #ifndef BLOCK_DIM_X 定义，
+                                                        不依赖此处注入的 BLOCK_DIM_Y
+  UNROLL_FACTOR         ✗ 不用          ✓ 使用         kernel7+ 的循环展开因子
+  WIDTH                 ✗ 不用          ✓ 使用         kernel10 的静态行宽提示
+
+  【validation target 不继承这些宏】
+  validation 是独立的 add_executable target，有自己的 target_compile_definitions
+  （或没有），与 softmax_cuda 的 PRIVATE 定义完全隔离，不会收到上述任何 -D。
+
   与 add_compile_options 的区别：
     add_compile_options        : 对所有 target 全局生效
-    target_compile_definitions : 只对指定 target（softmax_cuda）生效
+    target_compile_definitions : 只对指定 target（softmax_cuda）生效，不影响其他 target
 
   PRIVATE / PUBLIC / INTERFACE 的区别：
     PRIVATE   : 宏定义只作用于 softmax_cuda 自身的编译（本项目使用，叶子 target）
