@@ -9,4 +9,4 @@
 #include "kernels/softmax_kernel_7_using_shfl_down_sync_and_unroll.cuh"
 #include "kernels/softmax_kernel_8_online_softmax.cuh"
 #include "kernels/softmax_kernel_9.cuh"
-#include "kernels/softmax_kernel_10.cuh"
+#include "kernels/softmax_kernel_10_reg_store.cuh"

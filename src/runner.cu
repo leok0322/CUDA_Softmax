@@ -122,3 +122,12 @@ void run_softmax_kernel_using_online_softmax(uint totalRow, uint totalCol, float
   softmax_kernel_online_softmax<float, float4, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
+
+
+void run_softmax_kernel_reg_store(uint totalRow, uint totalCol, float* A, float* out) {
+  dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
+  dim3 grid_size = dim3(1, totalRow, 1);
+  assert(totalCol % 4 == 0 && "线程需要刚好能用flot4完全覆盖，并且是16字节对齐");
+  softmax_kernel_reg_store<float, float4, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  cudaCheck(cudaGetLastError());
+}

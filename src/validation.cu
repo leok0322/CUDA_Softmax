@@ -83,8 +83,6 @@ void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
         case 8:  run_softmax_kernel_using_online_softmax(totalRow, totalCol, A, out); break;
         case 9:  break;
         case 10: break;
-        case 11: break;
-        case 12: break;
         default:
             // throw：抛出异常，沿调用栈向上传播直到被 catch 捕获
             // std::invalid_argument：标准异常类，表示传入参数不合法
@@ -103,7 +101,7 @@ int main(int argc, char **argv) {
     }
 
     int kernel_num = std::stoi(argv[1]);
-    if (kernel_num < 0 || kernel_num > 12) {
+    if (kernel_num < 0 || kernel_num > 10) {
         std::cerr << "Please enter a valid kernel number (0-12)" << std::endl;
         exit(EXIT_FAILURE);
     }
@@ -170,7 +168,7 @@ int main(int argc, char **argv) {
     // ── 主测试循环 ────────────────────────────────────────────────────────────
     long repeat_times {50};   // 每个 size 重复 50 次取平均，减少 GPU 调度抖动影响
 
-    if (kernel_num != 3) {
+    if (kernel_num != 3 && kernel_num != 9  && kernel_num != 10) {
         for (uint size : SIZE) {
             m = n = size;
             std::cout << "dimensions(m=n) " << m << std::endl;
