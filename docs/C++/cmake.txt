@@ -273,7 +273,7 @@ CMakeLists.txt 完整解析
   set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9)")
   set(BLOCK_DIM_Y      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
   set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
-  set(WIDTH            0    CACHE STRING "Static row width hint; 0 means runtime")
+  set(WIDTH            0    CACHE STRING "kernel10 static row width; must equal actual totalCol; 0 = loop does not execute, output is uninitialized")
 
   普通 set() 与 CACHE set() 的区别：
     普通 set()  : 变量只存在于当前 cmake 运行的内存中，每次 Reload 都重新赋值
@@ -483,7 +483,9 @@ CMakeLists.txt 完整解析
                                                         #ifndef BLOCK_DIM_X 定义，
                                                         不依赖此处注入的 BLOCK_DIM_Y
   UNROLL_FACTOR         ✗ 不用          ✓ 使用         kernel7+ 的循环展开因子
-  WIDTH                 ✗ 不用          ✓ 使用         kernel10 的静态行宽提示
+  WIDTH                 ✗ 不用          ✓ 使用         kernel10 专用编译期行宽，必须与实际
+                                                        totalCol 一致；0（默认）= 循环不执行，
+                                                        输出为未初始化的垃圾值
 
   【validation target 不继承这些宏】
   validation 是独立的 add_executable target，有自己的 target_compile_definitions

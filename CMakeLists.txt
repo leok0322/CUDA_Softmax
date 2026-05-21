@@ -240,14 +240,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #     SOFTMAX_VARIANT : 选择 kernel 实现（1~9），对应 softmax_kernel1~9
 #     BLOCK_DIM_X     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
 #     UNROLL_FACTOR   : 循环展开因子（1/2/4/8），用于 kernel7/8/9 的向量化循环
-#     WIDTH           : 行宽静态提示（0 = 运行时由参数决定），非零时允许编译器静态优化
+#     WIDTH           : kernel10 专用的编译期行宽，必须与实际矩阵的 totalCol 完全一致。
+#                       kernel10 用 WIDTH 宏作为循环上界和 reg_array 大小，不读运行时参数 w，
+#                       两者不一致时循环越界或提前结束，结果静默错误。
+#                       totalCol 是运行时变量，无法直接用作编译期常量，
+#                       因此 kernel10 是为特定列数硬编译的 kernel：
+#                         cmake -DWIDTH=4096 → 只在 totalCol=4096 时结果正确
+#                         cmake -DWIDTH=0（默认）→ #ifndef WIDTH 跳过 4096，WIDTH=0，
+#                           循环条件 i<0 不执行，输出缓冲区为未初始化的垃圾值
 #
 #   用法示例（选择 variant=6，block_y=512）：
 #     cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_X=512 ..
 set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
 set(BLOCK_DIM_X      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
 set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
-set(WIDTH            0    CACHE STRING "Static row width hint; 0 means use runtime argument")
+# WIDTH 是 kernel10 专用编译期行宽，必须与实际totalCol 一致，而totalCol是编译期变量，会随时改变。
+set(WIDTH            4096    CACHE STRING "kernel10 static row width; must equal actual totalCol; 0 = loop does not execute, output is uninitialized")
 
 message(STATUS "Kernel config: SOFTMAX_VARIANT=${SOFTMAX_VARIANT}  BLOCK_DIM_X=${BLOCK_DIM_X}  UNROLL_FACTOR=${UNROLL_FACTOR}  WIDTH=${WIDTH}")
 
