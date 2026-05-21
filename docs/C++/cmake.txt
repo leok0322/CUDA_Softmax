@@ -280,13 +280,26 @@ CMakeLists.txt 完整解析
     CACHE set() : 变量写入 CMakeCache.txt（构建目录下），跨 Reload 持久保存；
                   若用户已通过 -D 传入值，CACHE set() 不会覆盖，保留用户的值
 
-  优先级：-D 命令行 > CMakeCache.txt 已有值 > set() 默认值
+  三层默认值的优先级（高 → 低）：
+    1. cmake -DSOFTMAX_VARIANT=6          → 最高，写入 cache，覆盖一切
+    2. set(SOFTMAX_VARIANT 8 CACHE ...)   → cache 无值时写入，cmake 层的兜底
+    3. #ifndef SOFTMAX_VARIANT            → build.ninja 无 -D 时的编译器层兜底
+       #define SOFTMAX_VARIANT 1
+       #endif
+    只要 cmake 通过 target_compile_definitions 把 -DSOFTMAX_VARIANT 写入 build.ninja，
+    第 3 层的 #ifndef 条件就为假，修改源文件中的默认值 1 完全没有效果。
 
   三种场景下的行为：
     首次 Reload，未传 -D         : cache 无值 → set() 写入默认值 8 → 编译用 8
     Reload 时传 -DSOFTMAX_VARIANT=6: CMake 把 6 写入 cache → set() 不覆盖 → 编译用 6
     再次 Reload，未传 -D         : cache 仍有 6（上次写入）→ set() 不覆盖 → 编译仍用 6
     重置为默认值                  : 删除 cmake-build-release/CMakeCache.txt 后 Reload
+                                    或显式传 -DSOFTMAX_VARIANT=8
+
+  【修改 CMakeLists.txt 中的默认值不会改变 cache 中已有的值】
+    若 cache 中已有 SOFTMAX_VARIANT=8，把文件里的默认值从 8 改为 6，
+    重新 cmake（Reload）后 cache 中仍是 8，因为 set(... CACHE ...) 检测到已有值就跳过。
+    必须显式传 -D 或删除 CMakeCache.txt 才能让修改生效。
 
   类型 STRING：在 CLion / cmake-gui 中以文本框展示（BOOL=复选框，PATH=目录选择器）。
 

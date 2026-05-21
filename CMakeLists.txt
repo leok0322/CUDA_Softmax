@@ -209,11 +209,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #     -DSOFTMAX_VARIANT=6              : 用户指定值，由 CLion CMake options 或命令行传入
 #     set() 永远不会覆盖已在 cache 中的值，两者优先级：-D > cache 已有值 > set() 默认值
 #
+#   三层默认值的优先级（高 → 低）：
+#     1. cmake -DSOFTMAX_VARIANT=6          → 最高，写入 cache，覆盖一切
+#     2. set(SOFTMAX_VARIANT 8 CACHE ...)   → cache 无值时写入，cmake 层的兜底
+#     3. #ifndef SOFTMAX_VARIANT            → build.ninja 无 -D 时的编译器层兜底
+#        #define SOFTMAX_VARIANT 1
+#        #endif
+#     只要 cmake 通过 target_compile_definitions 把 -DSOFTMAX_VARIANT 写入 build.ninja，
+#     第 3 层的 #ifndef 条件就为假，修改源文件中的默认值 1 完全没有效果。
+#
 #   三种场景下的行为：
 #     首次 Reload，未传 -D : cache 无值 → set() 写入默认值 8 → 编译用 8
 #     Reload 时传 -DSOFTMAX_VARIANT=6 : CMake 先把 6 写入 cache → set() 检测到已有值不覆盖 → 编译用 6
 #     再次 Reload，未传 -D : cache 仍有 6（上次写入）→ set() 不覆盖 → 编译仍用 6
 #     重置为默认值         : 删除 cmake-build-release/CMakeCache.txt 后 Reload，或显式传 -DSOFTMAX_VARIANT=8
+#
+#   【修改 CMakeLists.txt 中的默认值不会改变 cache 中已有的值】
+#     若 cache 中已有 SOFTMAX_VARIANT=8，把文件里的默认值从 8 改为 6，
+#     重新 cmake（Reload）后 cache 中仍是 8，因为 set(... CACHE ...) 检测到已有值就跳过。
+#     必须显式传 -D 或删除 CMakeCache.txt 才能让修改生效。
 #
 #   类型 STRING：在 CLion / cmake-gui 中以文本框展示，可直接编辑
 #     其他常用类型：BOOL（复选框）、PATH（目录选择器）、FILEPATH（文件选择器）
@@ -224,18 +238,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #   这四个宏对应 kernels.cu 顶部的 #ifndef 默认值，通过 cmake -D 可在配置阶段覆盖，
 #   等价于 benchmark.py 中 torch.utils.cpp_extension.load 的 extra_cuda_cflags / extra_cflags：
 #     SOFTMAX_VARIANT : 选择 kernel 实现（1~9），对应 softmax_kernel1~9
-#     BLOCK_DIM_Y     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
+#     BLOCK_DIM_X     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
 #     UNROLL_FACTOR   : 循环展开因子（1/2/4/8），用于 kernel7/8/9 的向量化循环
 #     WIDTH           : 行宽静态提示（0 = 运行时由参数决定），非零时允许编译器静态优化
 #
 #   用法示例（选择 variant=6，block_y=512）：
-#     cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 ..
+#     cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_X=512 ..
 set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
-set(BLOCK_DIM_Y      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
+set(BLOCK_DIM_X      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
 set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
 set(WIDTH            0    CACHE STRING "Static row width hint; 0 means use runtime argument")
 
-message(STATUS "Kernel config: SOFTMAX_VARIANT=${SOFTMAX_VARIANT}  BLOCK_DIM_Y=${BLOCK_DIM_Y}  UNROLL_FACTOR=${UNROLL_FACTOR}  WIDTH=${WIDTH}")
+message(STATUS "Kernel config: SOFTMAX_VARIANT=${SOFTMAX_VARIANT}  BLOCK_DIM_X=${BLOCK_DIM_X}  UNROLL_FACTOR=${UNROLL_FACTOR}  WIDTH=${WIDTH}")
 
 # ── 全局编译选项 ──────────────────────────────────────────────────────────────
 # add_compile_options 中的生成器表达式在 cmake 配置阶段求值，按条件决定是否将选项写入 build.ninja
@@ -435,6 +449,13 @@ endif()
 #   即：target_compile_definitions 本身在配置阶段执行（写 build.ninja），
 #       对 kernels.cu 的实际影响发生在编译阶段的预处理器步骤，两者不在同一阶段
 #
+#   【cmake --build 不需要重新传宏】
+#   cmake --build cmake-build-release --target softmax_cuda -- -j 18
+#     编译阶段直接读取已生成的 build.ninja，-DSOFTMAX_VARIANT=8 已在其中，
+#     无需也无法通过 --build 命令行再传宏；要改宏值必须重新跑配置阶段：
+#       cmake -DSOFTMAX_VARIANT=6 -B cmake-build-release   ← 重新配置，更新 build.ninja
+#       cmake --build cmake-build-release                  ← 编译阶段用新值
+#
 #   ── 宏的作用范围 ──────────────────────────────────────────────────────────────
 #
 #   target_compile_definitions(softmax_cuda PRIVATE ...) 只对 softmax_cuda target
@@ -453,10 +474,10 @@ endif()
 #   ─────────────────────────────────────────────────────────────────────────────
 #   TORCH_EXTENSION_NAME  ✓ 使用          ✗ 不用         PYBIND11_MODULE 展开时用
 #   SOFTMAX_VARIANT       ✗ 不用          ✓ 使用         #if SOFTMAX_VARIANT==N 选择 kernel
-#   BLOCK_DIM_Y           ✗ 不用          ✓ 使用         kernel1~6 的 block.y 维线程数；
+#   BLOCK_DIM_X           ✗ 不用          ✓ 使用         kernel1~6 的 block.y 维线程数；
 #                                                         kernel7/8/10 用各自 .cuh 内部的
 #                                                         #ifndef BLOCK_DIM_X 定义，
-#                                                         不依赖此处注入的 BLOCK_DIM_Y
+#                                                         不依赖此处注入的 BLOCK_DIM_X
 #   UNROLL_FACTOR         ✗ 不用          ✓ 使用         kernel7+ 的循环展开因子
 #   WIDTH                 ✗ 不用          ✓ 使用         kernel10 的静态行宽提示
 #
@@ -476,16 +497,16 @@ endif()
 #
 #   各宏定义展开为编译器标志（本机默认值示例）：
 #     TORCH_EXTENSION_NAME=softmax_cuda  →  -DTORCH_EXTENSION_NAME=softmax_cuda
-#     BLOCK_DIM_Y=${BLOCK_DIM_Y}         →  -DBLOCK_DIM_Y=1024
+#     BLOCK_DIM_X=${BLOCK_DIM_X}         →  -DBLOCK_DIM_X=1024
 #     UNROLL_FACTOR=${UNROLL_FACTOR}     →  -DUNROLL_FACTOR=8
 #     SOFTMAX_VARIANT=${SOFTMAX_VARIANT} →  -DSOFTMAX_VARIANT=8
 #     WIDTH=${WIDTH}                     →  -DWIDTH=0
 #
 #   在 kernels.cu 中，#ifndef 保护被这些 -D 标志覆盖：
-#     #ifndef BLOCK_DIM_Y
-#     #define BLOCK_DIM_Y 1024   ← 若未传 -D，用此默认值
+#     #ifndef BLOCK_DIM_X
+#     #define BLOCK_DIM_X 1024   ← 若未传 -D，用此默认值
 #     #endif
-#     编译时收到 -DBLOCK_DIM_Y=1024，#ifndef 条件为假，跳过此块，直接使用传入值
+#     编译时收到 -DBLOCK_DIM_X=1024，#ifndef 条件为假，跳过此块，直接使用传入值
 #
 #   TORCH_EXTENSION_NAME：PYBIND11_MODULE 宏展开时使用此名称作为 Python 模块名
 #     必须与库文件名（softmax_cuda）一致，否则 import 时报 ImportError：
@@ -509,10 +530,10 @@ endif()
 #     读取 CMake 变量值（"6"），写成编译器 -D 标志进入 build.ninja
 #     编译阶段 nvcc/g++ 读取后，才真正成为 C 预处理器宏
 #
-#   完整流水线（以 cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 为例）：
+#   完整流水线（以 cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_X=512 为例）：
 #
 #   ┌─ 配置阶段（cmake 命令） ─────────────────────────────────────────────────────
-#   │  触发：cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 -G Ninja -S . -B build/
+#   │  触发：cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_X=512 -G Ninja -S . -B build/
 #   │
 #   │  CMakeLists.txt 命令                    → 配置阶段执行的操作
 #   │  ─────────────────────────────────────────────────────────────────────────
@@ -526,12 +547,12 @@ endif()
 #   │  set(CMAKE_CUDA_ARCHITECTURES 86)      nvcc 编译时生成 -gencode arch=compute_86,...
 #   │  find_library(TORCH_PYTHON_LIBRARY)    找到 libtorch_python.so
 #   │  set(SOFTMAX_VARIANT 8 CACHE ...)      cache 已有 "6"（-D 传入），不覆盖
-#   │  set(BLOCK_DIM_Y 1024 CACHE ...)       cache 已有 "512"，不覆盖
+#   │  set(BLOCK_DIM_X 1024 CACHE ...)       cache 已有 "512"，不覆盖
 #   │  add_compile_options(-lineinfo ...)    向 build.ninja 写入全局编译标志
 #   │  add_library(softmax_cuda SHARED ...)  注册 target，声明三个源文件
 #   │  target_compile_definitions(...)  ←── 关键桥梁：读取 CMake 变量 → 写编译器 -D
 #   │    SOFTMAX_VARIANT=${SOFTMAX_VARIANT}  build.ninja: -DSOFTMAX_VARIANT=6
-#   │    BLOCK_DIM_Y=${BLOCK_DIM_Y}          build.ninja: -DBLOCK_DIM_Y=512
+#   │    BLOCK_DIM_X=${BLOCK_DIM_X}          build.ninja: -DBLOCK_DIM_X=512
 #   │    TORCH_EXTENSION_NAME=softmax_cuda   build.ninja: -DTORCH_EXTENSION_NAME=softmax_cuda
 #   │  target_include_directories(...)       build.ninja: -I/cuda/include -I/torch/include ...
 #   │  target_link_libraries(...)            build.ninja: -lcudart -ltorch -ltorch_python ...
@@ -547,22 +568,22 @@ endif()
 #   │
 #   │  g++ src/interface.cpp
 #   │      -DTORCH_EXTENSION_NAME=softmax_cuda    ← 编译器 -D → 预处理器宏
-#   │      -DBLOCK_DIM_Y=512                      ← 编译器 -D → 预处理器宏
+#   │      -DBLOCK_DIM_X=512                      ← 编译器 -D → 预处理器宏
 #   │      -D_GLIBCXX_USE_CXX11_ABI=1  -std=c++20  -I...
 #   │      -o interface.cpp.o
 #   │      预处理：PYBIND11_MODULE(TORCH_EXTENSION_NAME,m)→PYBIND11_MODULE(softmax_cuda,m)
 #   │
 #   │  nvcc src/run_kernels.cu
 #   │       -DSOFTMAX_VARIANT=6                   ← 编译器 -D → 预处理器宏
-#   │       -DBLOCK_DIM_Y=512                     ← 编译器 -D → 预处理器宏
+#   │       -DBLOCK_DIM_X=512                     ← 编译器 -D → 预处理器宏
 #   │       -DUNROLL_FACTOR=8  -DWIDTH=0  -D_GLIBCXX_USE_CXX11_ABI=1
 #   │       -std=c++20  -gencode arch=compute_86,...  -lineinfo  --use_fast_math
 #   │       -o run_kernels.cu.o
 #   │       预处理：#define SOFTMAX_VARIANT 6（-D 注入）
 #   │               #ifndef SOFTMAX_VARIANT → 已定义，跳过默认值 8
 #   │               softmax_kernel<SOFTMAX_VARIANT> → softmax_kernel<6>
-#   │               #define BLOCK_DIM_Y 512（-D 注入）
-#   │               dim3 block_size(1, BLOCK_DIM_Y, 1) → dim3 block_size(1, 512, 1)
+#   │               #define BLOCK_DIM_X 512（-D 注入）
+#   │               dim3 block_size(1, BLOCK_DIM_X, 1) → dim3 block_size(1, 512, 1)
 #   │
 #   │  ld -shared  interface.cpp.o  run_kernels.cu.o  softmax_kernel.cu.o
 #   │     -lcudart -ltorch -ltorch_cpu -lc10 -ltorch_python
@@ -570,7 +591,7 @@ endif()
 #   └─────────────────────────────────────────────────────────────────────────────
 target_compile_definitions(softmax_cuda PRIVATE
     TORCH_EXTENSION_NAME=softmax_cuda
-    BLOCK_DIM_Y=${BLOCK_DIM_Y}
+    BLOCK_DIM_X=${BLOCK_DIM_X}
     UNROLL_FACTOR=${UNROLL_FACTOR}
     SOFTMAX_VARIANT=${SOFTMAX_VARIANT}
     WIDTH=${WIDTH}
@@ -665,14 +686,14 @@ set_target_properties(validation PROPERTIES
 #   含义：重新执行 CMakeLists.txt，更新构建规则文件（build.ninja / Makefile）
 #         不编译任何源文件，不删除已有 .o 文件
 #   触发时机：修改 CMakeLists.txt 后必须执行，否则新的编译选项不会写入构建规则
-#             修改 SOFTMAX_VARIANT / BLOCK_DIM_Y 等 -D 参数后同样需要 Reload
+#             修改 SOFTMAX_VARIANT / BLOCK_DIM_X 等 -D 参数后同样需要 Reload
 #   命令行：
 #     cmake \
 #       -DCMAKE_BUILD_TYPE=Release \                                                  # 构建类型：Release（-O3 -lineinfo）/ Debug（-O0 -G）
 #       -DCMAKE_PREFIX_PATH=.venv/lib/python3.13/site-packages/torch/share/cmake \   # find_package(Torch) 从此目录读取 TorchConfig.cmake
 #       -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \               # find_package(Python3) 在此 venv 目录下搜索解释器
 #       -DSOFTMAX_VARIANT=8 \                                                         # 选择 softmax_kernel8，注入为编译期宏
-#       -DBLOCK_DIM_Y=1024 \                                                          # block Y 维线程数，注入为编译期宏
+#       -DBLOCK_DIM_X=1024 \                                                          # block Y 维线程数，注入为编译期宏
 #       -DUNROLL_FACTOR=8 \                                                           # 循环展开因子，注入为编译期宏
 #       -DWIDTH=0 \                                                                   # 行宽静态提示，0 = 运行时由参数决定
 #       -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \                                         # 指定底层构建工具路径为 ninja 可执行文件
@@ -749,7 +770,7 @@ set_target_properties(validation PROPERTIES
 #
 # ── 常见工作流 ──────────────────────────────────────────────────────────
 #   修改 CMakeLists.txt                → 手动 Reload → 手动 Build
-#   修改 SOFTMAX_VARIANT / BLOCK_DIM_Y → 手动 Reload → 手动 Build（宏值变化必须重新配置）
+#   修改 SOFTMAX_VARIANT / BLOCK_DIM_X → 手动 Reload → 手动 Build（宏值变化必须重新配置）
 #   只修改 kernels.cu / interface.cpp  → 手动 Build（增量编译，只重编改动的文件）
 #   编译状态混乱 / 链接报奇怪错误      → 手动 Rebuild
 #   彻底清除重来                        → 删除 cmake-build-release 目录 → 手动 Reload → 手动 Build
