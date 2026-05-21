@@ -50,7 +50,7 @@
 // URF：编译期常量，供 #pragma unroll 使用
 // #pragma unroll 要求操作数为编译期常量；constexpr int 满足此要求
 // 集中定义一次，消除 kernel 6/7/8/9/10 各自定义时的重复定义冲突
-constexpr int URF {UNROLL_FACTOR};
+constexpr int URF {8};
 
 
 #ifndef WIDTH
