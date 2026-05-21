@@ -7,81 +7,101 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import softmax_cuda  # 加载 softmax_cuda.cpython-313-x86_64-linux-gnu.so
 
-ROWS    = 4096
-COLS    = 4096
 REPEATS = 100
 WARMUP  = 10
 
-x = torch.rand(ROWS, COLS, device="cuda", dtype=torch.float32)
+# 测试的矩阵尺寸列表 (rows, cols)
+SIZES = [
+    (128,  1024),
+    (128,  4096),
+    (128,  16384),
+    (1024, 1024),
+    (1024, 4096),
+    (4096, 4096),
+]
 
-# ── 1. 正确性验证 ────────────────────────────────────────────────────────────
-out = softmax_cuda.softmax_cuda(x)
-ref = torch.softmax(x, dim=-1)
-
-match = torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
-print(f"correctness: {'PASS' if match else 'FAIL'}")
-if not match:
-    max_diff = (out - ref).abs().max().item()
-    print(f"  max_diff = {max_diff:.2e}")
-    sys.exit(1)
-
-# ── 2. 计时函数（用 CUDA Event，精度 ~0.5 us） ───────────────────────────────
-def benchmark(fn, warmup=WARMUP, repeats=REPEATS):
-    # 预热：消除 JIT / driver 初始化开销
-    for _ in range(warmup):
+# ── 计时函数（CUDA Event，精度 ~0.5 us） ─────────────────────────────────────
+def benchmark(fn):
+    for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-    end_events   = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
-
-    for i in range(repeats):
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(REPEATS)]
+    end_events   = [torch.cuda.Event(enable_timing=True) for _ in range(REPEATS)]
+    for i in range(REPEATS):
         start_events[i].record()
         fn()
         end_events[i].record()
-
     torch.cuda.synchronize()
     return [s.elapsed_time(e) for s, e in zip(start_events, end_events)]  # ms
 
-# ── 3. 运行 100 次 ───────────────────────────────────────────────────────────
-times_cuda  = benchmark(lambda: softmax_cuda.softmax_cuda(x))
-times_torch = benchmark(lambda: torch.softmax(x, dim=-1))
+def median_ms(times):
+    return torch.tensor(times).median().item()
 
-# ── 4. 统计 ──────────────────────────────────────────────────────────────────
-def stats(times, label):
-    t = torch.tensor(times)
-    print(f"\n{label} ({REPEATS} runs, {ROWS}x{COLS} float32):")
-    print(f"  mean   {t.mean().item():.3f} ms")
-    print(f"  median {t.median().item():.3f} ms")
-    print(f"  min    {t.min().item():.3f} ms")
-    print(f"  max    {t.max().item():.3f} ms")
-    return t.median().item()
+# ── 按尺寸循环，收集结果 ──────────────────────────────────────────────────────
+times_cuda  = []  # 每个元素对应一个尺寸的 100 次耗时列表
+times_torch = []
 
-med_cuda  = stats(times_cuda,  "custom CUDA softmax")
-med_torch = stats(times_torch, "torch.softmax")
+print(f"{'size':<12}  {'cuda mean':>10}  {'cuda median':>12}  {'torch mean':>10}  {'torch median':>12}  {'torch/cuda(median)':>15}  correctness")
+print("-" * 95)
 
-speedup = med_torch / med_cuda
-print(f"\nspeedup (torch / custom): {speedup:.2f}x")
+results = []  # 用于最终写入文件
 
-# ── 5. 追加写入比较结果 ───────────────────────────────────────────────────────
+for rows, cols in SIZES:
+    x = torch.rand(rows, cols, device="cuda", dtype=torch.float32)
+
+    # 正确性验证
+    out = softmax_cuda.softmax_cuda(x)
+    ref = torch.softmax(x, dim=-1)
+    match = torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
+
+    if not match:
+        max_diff = (out - ref).abs().max().item()
+        print(f"{rows}x{cols:<6}  correctness FAIL  max_diff={max_diff:.2e}")
+        times_cuda.append(None)
+        times_torch.append(None)
+        results.append((rows, cols, None, None, False))
+        continue
+
+    # 计时
+    t_cuda  = benchmark(lambda: softmax_cuda.softmax_cuda(x))
+    t_torch = benchmark(lambda: torch.softmax(x, dim=-1))
+    times_cuda.append(t_cuda)
+    times_torch.append(t_torch)
+
+    tc = torch.tensor(t_cuda)
+    tt = torch.tensor(t_torch)
+    torch_over_cuda = tt.median().item() / tc.median().item()
+
+    print(f"{rows}x{cols:<6}"
+          f"  {tc.mean().item():>9.3f}ms"
+          f"  {tc.median().item():>11.3f}ms"
+          f"  {tt.mean().item():>9.3f}ms"
+          f"  {tt.median().item():>11.3f}ms"
+          f"  {torch_over_cuda:>14.2f}x"
+          f"  PASS")
+    results.append((rows, cols, t_cuda, t_torch, True))
+
+# ── 追加写入结果文件 ──────────────────────────────────────────────────────────
 RESULT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_results")
 RESULT_FILE = os.path.join(RESULT_DIR, "python_test_result.txt")
 
-def fmt_stats(times, label):
-    t = torch.tensor(times)
-    return (
-        f"  {label}:\n"
-        f"    mean={t.mean().item():.3f}ms  median={t.median().item():.3f}ms"
-        f"  min={t.min().item():.3f}ms  max={t.max().item():.3f}ms"
+timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+lines = [f"\n[{timestamp}]  repeats={REPEATS}"]
+for rows, cols, t_cuda, t_torch, ok in results:
+    if not ok:
+        lines.append(f"  {rows}x{cols:<6}  FAIL")
+        continue
+    tc = torch.tensor(t_cuda)
+    tt = torch.tensor(t_torch)
+    torch_over_cuda = tt.median().item() / tc.median().item()
+    lines.append(
+        f"  {rows}x{cols:<6}"
+        f"  cuda  mean={tc.mean().item():.3f}ms  median={tc.median().item():.3f}ms"
+        f"  torch mean={tt.mean().item():.3f}ms  median={tt.median().item():.3f}ms"
+        f"  torch/cuda={torch_over_cuda:.2f}x"
     )
 
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-lines = [
-    f"\n[{timestamp}]  {ROWS}x{COLS} float32  repeats={REPEATS}",
-    fmt_stats(times_cuda,  "custom CUDA"),
-    fmt_stats(times_torch, "torch.softmax"),
-    f"  speedup (torch/custom): {speedup:.2f}x",
-]
 with open(RESULT_FILE, "a") as f:
     f.write("\n".join(lines) + "\n")
 
