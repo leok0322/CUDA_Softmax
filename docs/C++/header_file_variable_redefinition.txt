@@ -1,0 +1,189 @@
+头文件变量重复定义问题与解决方案
+===================================
+
+
+一、问题背景
+------------
+
+头文件被多处 include 时，预处理器将其内容原样展开到每个包含它的翻译单元（TU）。
+若多个头文件在文件作用域定义同名变量，且它们被包含进同一 TU，
+则该 TU 的编译结果中出现两次相同名字的定义，编译器报重复定义错误。
+
+本项目中的具体情况：
+
+  kernels.cuh 将所有 kernel 头文件包含进同一 TU：
+    #include "softmax_kernel_7_using_shfl_down_sync.cuh"
+    #include "softmax_kernel_8_online_softmax.cuh"
+    ...
+
+  kernel7 和 kernel8 各自在文件作用域定义：
+    constexpr int URF {4};
+
+  预处理展开后，同一 TU 内出现两次 constexpr int URF {4}，
+  编译器报 error: redefinition of 'URF'。
+
+关键概念：
+  · 翻译单元（Translation Unit, TU）：一个 .cpp/.cu 文件经预处理后的完整展开结果，
+    是编译器的最小编译单位。
+  · #include：纯文本展开，预处理器将被包含文件的全部内容插入当前位置，
+    不存在"已经包含过"的语义，同一符号出现多次由此而来。
+
+
+二、为什么 inline 不能解决此问题
+---------------------------------
+
+inline 的作用是允许同一定义出现在多个 TU 中，链接器选取其中一份合并：
+
+  // TU1（source1.cpp）：
+  inline constexpr int URF {4};   // OK，TU1 中只有一份
+
+  // TU2（source2.cpp）：
+  inline constexpr int URF {4};   // OK，TU2 中只有一份
+
+  // 链接器：两个 TU 的 URF 定义合并为一个符号，正常链接。
+
+但 inline 不允许同一 TU 同一作用域内出现两次定义：
+
+  // 同一 TU（展开后）：
+  inline constexpr int URF {4};   // kernel7.cuh 展开的定义
+  inline constexpr int URF {4};   // kernel8.cuh 展开的定义
+  // error: redefinition of 'URF'，问题未解决
+
+结论：inline 解决的是"多 TU 同一定义"的问题，
+      解决不了"同一 TU 同名两次定义"的问题。
+
+| 场景                          | inline 能否解决 |
+|-------------------------------|-----------------|
+| 同一符号定义在多个 TU 中      | 能（链接器合并）|
+| 同一符号定义在同一 TU 中两次  | 不能            |
+
+
+三、三种解决方案
+----------------
+
+方案A（推荐）：将变量定义移入函数体内
+--------------------------------------
+
+  将 constexpr int URF {4}; 从文件作用域移入每个 kernel 函数体内：
+
+  // softmax_kernel_7.cuh
+  __global__ void softmax_kernel_7(...) {
+      constexpr int URF {4};    // 函数作用域，仅在此函数内可见
+      #pragma unroll URF
+      for (...) { ... }
+  }
+
+  // softmax_kernel_8.cuh
+  __global__ void softmax_kernel_8(...) {
+      constexpr int URF {4};    // 不同函数体，互不干扰
+      #pragma unroll URF
+      for (...) { ... }
+  }
+
+  优点：
+    · 各 kernel 完全独立，无任何共享状态
+    · #pragma unroll 可识别函数内的 constexpr int（nvcc 支持）
+    · 不依赖任何额外机制，代码清晰
+  缺点：
+    · 每个头文件都要单独写一遍，若需统一修改 URF 值需改多处
+
+
+方案B：公共头文件集中定义
+--------------------------
+
+  新建 kernels_common.cuh，集中定义一次 URF：
+
+  // kernels_common.cuh
+  #pragma once
+  constexpr int URF {4};
+
+  // softmax_kernel_7.cuh
+  #include "kernels_common.cuh"   // #pragma once 保证只展开一次
+  __global__ void softmax_kernel_7(...) { ... }
+
+  // softmax_kernel_8.cuh
+  #include "kernels_common.cuh"   // 重复 include，但 #pragma once 跳过展开
+  __global__ void softmax_kernel_8(...) { ... }
+
+  // kernels.cuh（同一 TU）：
+  #include "softmax_kernel_7.cuh"   // 展开时 kernels_common.cuh 首次展开，URF 定义一次
+  #include "softmax_kernel_8.cuh"   // #pragma once 跳过 kernels_common.cuh，URF 不重复
+
+  优点：
+    · 统一修改 URF 只需改 kernels_common.cuh 一处
+    · 逻辑清晰，符合"单一定义原则"
+  缺点：
+    · 新增一个公共头文件，增加文件数量
+    · 所有 kernel 头文件都需 include 公共头文件，引入轻微耦合
+
+
+方案C（当前采用）：宏 guard 保护
+----------------------------------
+
+  第一个被包含的头文件定义 URF 并设置宏标志，
+  后续头文件检测到标志已存在则跳过定义：
+
+  // softmax_kernel_7.cuh（或任意第一个被包含的头文件）
+  #ifndef URF_DEFINED
+  #define URF_DEFINED
+  constexpr int URF {4};
+  #endif
+
+  // softmax_kernel_8.cuh（后续头文件使用相同的 guard）
+  #ifndef URF_DEFINED
+  #define URF_DEFINED
+  constexpr int URF {4};
+  #endif
+
+  // kernels.cuh 展开后：
+  //   kernel7.cuh 首先展开 → URF_DEFINED 未定义 → 定义 URF_DEFINED + URF
+  //   kernel8.cuh 随后展开 → URF_DEFINED 已定义 → 跳过 #ifndef 块，不重复定义
+
+  优点：
+    · 不新增文件，不改变函数结构，侵入性最小
+    · 适合快速修复重复定义问题
+  缺点：
+    · URF 定义仅在文件作用域，各头文件之间存在隐式耦合（共享同一 guard 宏）
+    · 包含顺序决定哪个头文件的值生效，顺序改变可能引入潜在问题
+    · 宏 guard 命名不当时易与其他宏冲突
+
+
+四、方案对比
+------------
+
+| 对比项             | 方案A（函数内定义）| 方案B（公共头文件）| 方案C（宏 guard）  |
+|--------------------|--------------------|--------------------|--------------------|
+| 各 kernel 独立性   | 完全独立           | 依赖公共头文件     | 隐式共享 guard 宏  |
+| 修改 URF 的成本    | 逐个修改           | 改一处生效         | 逐个修改           |
+| 引入新文件         | 否                 | 是                 | 否                 |
+| 对包含顺序的依赖   | 无                 | 无                 | 有（首个定义生效） |
+| 代码可读性         | 高                 | 高                 | 中（需理解 guard） |
+| 推荐程度           | 推荐               | 适合多处共用时     | 快速修复可用       |
+
+
+五、相关知识：#pragma once vs include guard
+--------------------------------------------
+
+#pragma once 是头文件级别的保护，防止同一头文件在同一 TU 中被展开两次：
+
+  // header.h
+  #pragma once
+  int x = 0;
+
+  // main.cpp
+  #include "header.h"   // 展开，x 定义一次
+  #include "header.h"   // #pragma once 跳过，x 不重复定义
+
+等价的传统写法（include guard）：
+  // header.h
+  #ifndef HEADER_H
+  #define HEADER_H
+  int x = 0;
+  #endif
+
+区别：
+  · #pragma once：编译器扩展，基于文件路径/inode 识别重复，通常更快
+  · include guard：C++ 标准机制，基于宏名识别重复，宏名冲突时可能失效
+
+本节方案C 利用了与 include guard 相同的宏机制，
+但保护的不是整个头文件，而是头文件内的某段定义。
