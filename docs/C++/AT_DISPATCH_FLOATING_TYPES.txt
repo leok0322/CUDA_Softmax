@@ -166,9 +166,49 @@ AT_DISPATCH_FLOATING_TYPES — 完整解析笔记
   NVCC 为每个模板实例各生成一份 PTX / SASS 机器码（两份独立代码）。
   运行时只进入其中一个 case，无运行时类型转换开销。
 
+  【x.scalar_type() 是运行时值，为何模板实例化不报错】
+
+  模板实例化（softmax_kernel<scalar_t>）发生在编译期，要求类型参数是编译期已知的类型。
+  x.scalar_type() 是运行时值，两者看似矛盾，实则不矛盾：
+
+  宏展开为 switch 语句，每个 case 分支里的 scalar_t 是 using 声明的编译期类型别名：
+    case Float:  { using scalar_t = float;  softmax_kernel<scalar_t><<<...>>>(...); }
+    case Double: { using scalar_t = double; softmax_kernel<scalar_t><<<...>>>(...); }
+
+  编译器在编译阶段把两个分支都编译，两份实例都生成：
+    softmax_kernel<float>  → 编译进二进制
+    softmax_kernel<double> → 编译进二进制
+
+  x.scalar_type() 的运行时值只决定 switch 跳到哪个 case 执行，
+  不参与模板实例化——模板实例化已在编译期全部完成。
+  本质是：运行时选择执行哪个已编译好的实例，而非运行时实例化模板。
+
   对比运行时多态（虚函数）：
     虚函数 → 运行时查 vtable → 一份代码，靠分支决定行为
     AT_DISPATCH → 编译期为每种类型展开 → 多份代码，运行时只选其一
+
+  【为何不能用虚函数替代 AT_DISPATCH】
+
+  原因一：虚函数不能是模板函数（语言层面直接禁止）
+
+    struct Base {
+        template <typename T>
+        virtual void kernel(T* a, T* b);  // 编译错误：虚函数不能是模板
+    };
+
+    虚函数表（vtable）在编译期生成，大小固定；
+    模板函数的实例数量取决于调用方用了哪些类型，编译期无法确定 vtable 槽位数。
+    两者机制根本不相容，C++ 标准明确禁止。
+
+  原因二：即使绕过限制，虚函数也解决不了类型分发问题（根本原因）
+
+    AT_DISPATCH 要解决的问题是：根据运行时 dtype 选择正确的编译期类型 T。
+    虚函数做的是：根据运行时对象类型选择函数实现，但函数签名里的参数类型在
+    编译期就固定了——仍然需要在某处决定 T 是 float 还是 double，虚函数本身
+    不提供"运行时 dtype → 编译期类型参数"这个桥梁。
+
+    AT_DISPATCH 的本质是把"运行时 dtype 判断"转化为"编译期类型选择"，
+    这个工作只能由 switch + using 别名完成，虚函数从设计上就不是为此而生的。
 
 ================================================================================
 四、第三个参数：lambda ([&] { ... })
