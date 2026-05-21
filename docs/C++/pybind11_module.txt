@@ -389,20 +389,47 @@ PYBIND11_MODULE 与 m.def 详解
     GPU 显存全程不动，无任何数据拷贝。
 
 
-八、TORCH_EXTENSION_NAME vs 模块名字符串一致性
+八、项目中四个 softmax_cuda 的来源
 ================================================================================
 
-  三处名字必须完全一致，否则 import 失败：
+  代码中出现四处 softmax_cuda，各自由不同的地方决定，互相独立：
 
-    ① cmake add_library 目标名 / set_target_properties 输出文件名
-        → 决定 .so 文件名：softmax_cuda.cpython-313-...so
+    add_library(softmax_cuda SHARED ...)
+        │  决定输出文件名：softmax_cuda.cpython-313-...so
+        │
+        │  import softmax_cuda
+        └─→ Python 按文件名搜索 .so，dlopen 加载
+                  │
+                  │  dlsym(handle, "PyInit_softmax_cuda")
+                  └─→ 入口符号 = "PyInit_" + TORCH_EXTENSION_NAME
+                            │    TORCH_EXTENSION_NAME 由
+                            │    target_compile_definitions 注入
+                            │
+                            └─→ PyInit_softmax_cuda() 执行
+                                      │
+                                      │  m.def("softmax_cuda", ...)
+                                      └─→ __dict__["softmax_cuda"] = <包装对象>
+                                                │
+                                                │  cuda.softmax_cuda(x)
+                                                └─→ 查 __dict__["softmax_cuda"]
 
-    ② target_compile_definitions TORCH_EXTENSION_NAME=softmax_cuda
-        → 注入宏，PYBIND11_MODULE 展开时用于生成 PyInit_softmax_cuda 符号
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │ 名字                         │ 决定者                                   │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ .so 文件名中的 softmax_cuda  │ add_library(softmax_cuda ...)            │
+  │ PyInit_softmax_cuda 符号名   │ TORCH_EXTENSION_NAME（cmake 注入）       │
+  │ cuda.softmax_cuda 属性名     │ m.def("softmax_cuda", ...) 第一个参数    │
+  │ &softmax_cuda 函数指针       │ C++ 函数定义名，与上三者无强制关联       │
+  └──────────────────────────────┴──────────────────────────────────────────┘
 
-    ③ Python import softmax_cuda
-        → 解释器按此名查找 .so 并查找 PyInit_softmax_cuda 符号
+  【必须一致 vs 可以不同】
 
-    ① 决定 .so 文件名和 Python 搜索的入口符号名
-    ② 决定 .so 内实际生成的入口符号名
-    ① = ② 才能让 Python import 成功找到符号并调用
+    .so 文件名（add_library）与 PyInit_ 符号名（TORCH_EXTENSION_NAME）必须一致：
+      .so 文件名决定 Python 搜索的入口符号字符串
+      TORCH_EXTENSION_NAME 决定 .so 内实际生成的符号名
+      两者不匹配 → dlsym 找不到符号 → ImportError
+
+    cuda.softmax_cuda 属性名（m.def 第一参数）与 &softmax_cuda 函数名
+    和上面两者名字相同只是惯例，改成其他名字也能正常运行：
+      m.def("my_softmax", &softmax_cuda, "...")
+      → Python 侧用 cuda.my_softmax(x) 调用，完全合法
