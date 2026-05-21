@@ -2,19 +2,8 @@
 
 #include <cuda_runtime.h>
 
-#ifndef BLOCK_DIM_X
-#define BLOCK_DIM_X 1024
-#endif
+#include "common.cuh"    // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
 
-
-#ifndef UNROLL_FACTOR
-#define UNROLL_FACTOR 4
-#endif
-
-#ifndef URF_DEFINED
-#define URF_DEFINED
-constexpr int URF {UNROLL_FACTOR};
-#endif
 
 template <typename scalar_t>
 __global__ void softmax_kernel_6(scalar_t* __restrict__ a, scalar_t* __restrict__ b, int w, int h)

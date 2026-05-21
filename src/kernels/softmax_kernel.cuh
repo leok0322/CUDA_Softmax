@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>   // CUDA Runtime API：dim3 / __global__ / __expf / fmaxf /
                              //   threadIdx / blockIdx / __syncthreads 等 kernel 编写所需
 #include <cstdint>          // int64_t：固定宽度整数，kernel 参数 totalRow / totalCol 的类型
-
+#include "common.cuh"   // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
 
 // ── softmax_kernel：朴素实现，每个线程独立扫描整行 ──────────────────────────
 //

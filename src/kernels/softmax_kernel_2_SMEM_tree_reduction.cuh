@@ -10,9 +10,8 @@
 //     #endif
 //   或通过编译器 -DBLOCK_DIM_Y=1024 注入（CMakeLists.txt 的 target_compile_definitions）
 
-#ifndef BLOCK_DIM_X
-#define BLOCK_DIM_X 1024
-#endif
+#include "common.cuh"    // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
+
 
 template <typename scalar_t,  typename scalar_i>
 __global__ void softmax_kernel_2(scalar_t* __restrict__ a, scalar_t* __restrict__ b, scalar_i totalRow, scalar_i totalCol) {

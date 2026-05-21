@@ -161,7 +161,90 @@ inline 的作用是允许同一定义出现在多个 TU 中，链接器选取其
 | 推荐程度           | 推荐               | 适合多处共用时     | 快速修复可用       |
 
 
-五、相关知识：#pragma once vs include guard
+五、方案C 的隐患：宏 guard 导致 autotune 脚本失效
+----------------------------------------------------
+
+方案C（当前采用）在实际使用中暴露了一个隐患：
+autotune 脚本用 sed 修改 kernel8 的 URF 值，但修改对编译结果没有任何影响。
+
+【问题复现】
+
+  kernels.cuh 的 include 顺序：
+    #include "kernel_7.cuh"   ← 先展开，#ifndef URF_DEFINED 为真 → 定义 URF_DEFINED 和 URF
+    #include "kernel_8.cuh"   ← 后展开，#ifndef URF_DEFINED 为假 → 整块跳过
+
+  autotune 脚本：
+    sed -i "s/constexpr int URF {.*/constexpr int URF {1};/" kernel_8.cuh
+    cmake --build ...   ← 重新编译
+
+  看似修改了 kernel8 的 URF，实际上 kernel8 的 #ifndef URF_DEFINED 块
+  在预处理时被跳过，sed 修改的那行根本不进入编译。
+  所有 autotune 轮次编译出的二进制完全相同，
+  测出来的"URF 改变性能不变"是假象，不是 URF 无效，而是 URF 根本没改变。
+
+【关键点：为什么 kernel7 能干扰 kernel8】
+
+  kernel8 没有 #include kernel7，两者之间没有任何直接依赖。
+  干扰的根源不是 kernel8"看到了"kernel7 的状态，
+  而是 runner.cu 通过 kernels.cuh 将所有 kernel 拉进了同一个翻译单元：
+
+    runner.cu
+      └── #include "kernels.cuh"
+            ├── #include "kernel_7.cuh"   ← 展开后 URF_DEFINED 进入 TU 的宏状态
+            └── #include "kernel_8.cuh"   ← 在同一 TU 中继续展开，看到 URF_DEFINED 已存在
+
+  预处理器在一个 TU 内线性展开所有 #include，宏状态全程共享、累积。
+  kernel7 展开时写入 URF_DEFINED，kernel8 展开时读到该宏已定义，
+  #ifndef URF_DEFINED 为假，整块跳过——与 kernel8 是否 include kernel7 无关。
+
+  本质：同一 TU 的线性展开，而非两个头文件之间的直接依赖。
+
+【根本原因】
+
+  方案C 的"首个定义生效"特性：包含顺序决定哪个 kernel 的 URF 值实际生效。
+  其他 kernel（此处为 kernel8）的 URF 行被静默跳过，
+  外部工具（如 autotune 脚本）修改这些被跳过的行没有任何效果。
+
+
+六、正确解决方案：公共头文件（方案B 的实践）
+----------------------------------------------
+
+在 src/kernels/ 下新建 common.cuh，集中定义所有共用常量：
+
+  // common.cuh
+  #pragma once
+  #ifndef BLOCK_DIM_X
+  #define BLOCK_DIM_X 1024
+  #endif
+  #ifndef UNROLL_FACTOR
+  #define UNROLL_FACTOR 4
+  #endif
+  constexpr int URF {UNROLL_FACTOR};  // 只定义一次，无 URF_DEFINED guard
+
+每个 kernel 文件各自 #include "common.cuh"，不在 kernels.cuh 里统一 include：
+
+  // 方案X：只在 kernels.cuh 里 include common.cuh
+  kernels.cuh
+    #include "common.cuh"
+    #include "kernel_8.cuh"   ← 单独 #include "kernel_8.cuh" 时 common.cuh 未被包含，编译失败
+                                 kernel 文件对外部包含顺序产生隐式依赖
+
+  // 方案B（推荐）：每个 kernel 文件自己 include common.cuh
+  kernel_8.cuh
+    #include "common.cuh"     ← 自己声明依赖，自包含
+  kernel_7.cuh
+    #include "common.cuh"     ← #pragma once 保证同一 TU 只展开一次，不重复定义
+
+  每个 kernel 文件单独使用时也能正确编译，不依赖外部包含顺序。
+
+【autotune 脚本修复】
+
+  URF 在 common.cuh 中只定义一次，autotune 只需修改 common.cuh 中的那一行：
+    sed -i "s/constexpr int URF {.*/constexpr int URF {$urf};/" common.cuh
+  修改后重编译，所有 kernel 均使用新值，脚本真正生效。
+
+
+七、相关知识：#pragma once vs include guard
 --------------------------------------------
 
 #pragma once 是头文件级别的保护，防止同一头文件在同一 TU 中被展开两次：

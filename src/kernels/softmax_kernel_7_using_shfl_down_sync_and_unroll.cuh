@@ -3,19 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda/cmath>
 
-#ifndef BLOCK_DIM_X
-#define BLOCK_DIM_X 1024
-#endif
-
-#ifndef UNROLL_FACTOR
-#define UNROLL_FACTOR 4
-#endif
-
-#ifndef URF_DEFINED
-#define URF_DEFINED
-constexpr int URF {UNROLL_FACTOR};
-#endif
-
+#include "common.cuh"   // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
 
 
 template <typename scalar_t>

@@ -1,42 +1,11 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "common.cuh"    // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
 
-#ifndef BLOCK_DIM_X
-#define BLOCK_DIM_X 1024
-#endif
+// URF 由 common.cuh 集中定义，此文件不再单独定义。
+// 详见 docs/C++/header_file_variable_redefinition.txt
 
-
-// ── URF 重复定义问题 ────────────────────────────────────────────────────────
-// kernels.cuh 将所有 kernel 头文件包含进同一翻译单元（TU）。
-// kernel7 和 kernel8 各自在文件作用域定义 constexpr int URF {4}，
-// 预处理展开后同一 TU 内出现两次相同名字的定义 → 编译器报重复定义错误。
-//
-// 【为什么 inline constexpr int URF {4} 不行】
-//   inline 允许同一定义出现在多个 TU 中（链接器合并），
-//   但不允许同一 TU 同一作用域内出现两次定义，问题依然存在。
-//
-// 【三种解决方案】
-//   方案A（推荐）：函数内定义
-//     将 constexpr int URF {4}; 移入每个 kernel 函数体内，
-//     #pragma unroll 可识别函数内的 constexpr int，各 kernel 完全独立。
-//
-//   方案B：公共头文件
-//     新建 kernels_common.cuh，集中定义一次 URF，
-//     所有 kernel 头文件 include 它；依赖 #pragma once 保证只展开一次。
-//
-//   方案C（当前采用）：宏 guard 保护
-//     第一个被包含的头文件定义 URF 并设置宏标志 URF_DEFINED，
-//     后续头文件检测到标志已存在则跳过定义，避免重复。
-// ────────────────────────────────────────────────────────────────────────────
-#ifndef UNROLL_FACTOR
-#define UNROLL_FACTOR 4
-#endif
-
-#ifndef URF_DEFINED
-#define URF_DEFINED
-constexpr int URF {UNROLL_FACTOR};
-#endif
 
 
 

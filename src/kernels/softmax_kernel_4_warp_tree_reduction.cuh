@@ -2,11 +2,7 @@
 
 #include <cuda_runtime.h>
 
-
-
-#ifndef BLOCK_DIM_X
-#define BLOCK_DIM_X 1024
-#endif
+#include "common.cuh"   // BLOCK_DIM_X / UNROLL_FACTOR / URF，所有 kernel 共用
 
 // ── kernel4 改进：warp shuffle 替换 shared memory 树形规约 ──────────────────
 //
