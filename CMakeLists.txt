@@ -251,7 +251,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #
 #   用法示例（选择 variant=6，block_y=512）：
 #     cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_X=512 ..
-set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
+set(SOFTMAX_VARIANT  7    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
 set(BLOCK_DIM_X      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
 set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
 # WIDTH 是 kernel10 专用编译期行宽，必须与实际totalCol 一致，而totalCol是编译期变量，会随时改变。

@@ -167,6 +167,7 @@ torch::Tensor softmax_cu(torch::Tensor x)
     #if SOFTMAX_VARIANT == 4
       dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
       dim3 grid_size = dim3(1, totalBatch * totalRow, 1);
+      assert(totalCol % 4 == 0 && "线程需要刚好能用flot4完全覆盖，并且是16字节对齐");
       AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
           softmax_kernel_vectorize<scalar_t, float4, int64_t><<<grid_size,block_size>>>(x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),totalRow, totalCol);
           cudaCheck(cudaGetLastError());
@@ -176,6 +177,7 @@ torch::Tensor softmax_cu(torch::Tensor x)
     #if SOFTMAX_VARIANT == 5
       dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
       dim3 grid_size = dim3(1, totalBatch * totalRow, 1);
+      assert(totalCol % 4 == 0 && "线程需要刚好能用flot4完全覆盖，并且是16字节对齐");
       AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
           softmax_kernel_threadNum1024_double_warp_tree_reduction<scalar_t, float4, int64_t><<<grid_size,block_size>>>(x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),totalRow, totalCol);
           cudaCheck(cudaGetLastError());
@@ -185,6 +187,7 @@ torch::Tensor softmax_cu(torch::Tensor x)
     #if SOFTMAX_VARIANT == 6
       dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
       dim3 grid_size = dim3(1, totalBatch * totalRow, 1);
+      assert(totalCol % 4 == 0 && "线程需要刚好能用flot4完全覆盖，并且是16字节对齐");
       AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
           softmax_kernel_using_shfl_down_sync_and_unroll<scalar_t, float4, int64_t><<<grid_size,block_size>>>(x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),totalRow, totalCol);
           cudaCheck(cudaGetLastError());
@@ -194,6 +197,7 @@ torch::Tensor softmax_cu(torch::Tensor x)
     #if SOFTMAX_VARIANT == 7
       dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
       dim3 grid_size = dim3(1, totalBatch * totalRow, 1);
+      assert(totalCol % 4 == 0 && "线程需要刚好能用flot4完全覆盖，并且是16字节对齐");
       AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
           softmax_kernel_online_softmax<scalar_t, float4, int64_t><<<grid_size,block_size>>>(x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(),totalRow, totalCol);
           cudaCheck(cudaGetLastError());
