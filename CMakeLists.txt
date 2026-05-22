@@ -10,7 +10,7 @@ set(CMAKE_CXX_COMPILER  "/usr/bin/g++")
 #   - LANGUAGES 决定了后续 add_library / add_executable 能编译的文件类型：
 #       .cpp  -> g++ 编译为纯主机代码（interface.cpp 中的 pybind11 模块定义）
 #       .cu   -> nvcc 编译为主机 + 设备混合代码（kernels.cu 中的 softmax kernel）
-project(Fast_Softmax LANGUAGES CXX CUDA)
+project(CUDA_Softmax LANGUAGES CXX CUDA)
 
 # 导出编译命令到 compile_commands.json，供 clangd / clang-tidy 做代码分析和补全
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

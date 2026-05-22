@@ -475,6 +475,61 @@ void counter() {
 五、CUDA 中的链接性
 ========================================
 
+【__global__ kernel 的链接性】
+
+__global__ 函数（kernel）默认是内部链接（internal linkage）：
+- 不能跨翻译单元直接调用，链接器无法处理 <<<>>> 语法
+- 编译器需要在同一 TU 内知道 kernel 的完整定义，才能生成启动代码
+  （参数传递、grid/block 配置、参数打包等均在编译期完成）
+
+// a.cu
+__global__ void my_kernel() { }      // 内部链接
+
+// b.cu
+extern __global__ void my_kernel();  // 声明合法，但 <<<>>> 调用无法链接
+my_kernel<<<1,1>>>();                 // 链接报错：无法跨 TU 调用 __global__
+
+工程上的标准绕法：把 kernel 定义写在头文件（.cuh）中，由调用方 .cu include，
+使 kernel 定义与启动代码处于同一翻译单元：
+
+// kernels.cuh
+__global__ void my_kernel() { }      // 定义放头文件
+
+// runner.cu
+#include "kernels.cuh"
+my_kernel<<<1,1>>>();                 // 合法：同一 TU 内
+
+这也是本项目的结构——kernel 定义放在 .cuh 中，由 runner.cu include 后在同一 TU 内使用。
+
+【为什么 .cuh 中直接定义 kernel 不会重复定义】
+
+内部链接的含义是：每个 TU 各自持有独立副本，链接器不会尝试合并它们，
+因此多个 .cu include 同一个 .cuh 不会触发 "multiple definition" 错误。
+
+这与 C++ 中 static 函数 / const 变量放头文件的道理完全相同：
+
+// C++ 类比
+static void helper() { }         // internal → 多个 TU include → 各自独立副本 → 合法
+
+// CUDA 同理
+__global__ void my_kernel() { }  // internal → 多个 TU include → 各自独立副本 → 合法
+
+反过来，正因为 kernel 是内部链接，.cuh 中直接写定义才是安全的。
+若 kernel 是外部链接（像普通 __host__ 函数），多个 .cu include 同一 .cuh
+就会报 multiple definition，必须像 C++ 那样做声明与定义分离。
+
+各函数限定符的链接性对比：
+
+┌──────────────────────┬──────────────────┬──────────────┐
+│       函数类型       │     链接属性     │ 可跨翻译单元 │
+├──────────────────────┼──────────────────┼──────────────┤
+│ __global__（kernel） │ 内部链接         │ 否           │
+├──────────────────────┼──────────────────┼──────────────┤
+│ __device__           │ 内部链接（默认） │ 否（默认）   │
+├──────────────────────┼──────────────────┼──────────────┤
+│ __host__             │ 外部链接（默认） │ 是           │
+└──────────────────────┴──────────────────┴──────────────┘
+
 CUDA 默认编译模式（无 -rdc=true）：
 - 每个 .cu 文件独立编译成 fat binary（PTX + SASS），不做跨 TU device 链接
 - __device__ / __global__ 函数定义在 .cuh 中 → 每个 TU 独立编译，不会 ODR 冲突
