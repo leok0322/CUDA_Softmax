@@ -166,6 +166,25 @@
       #pragma unroll 的参数在此 nvcc 版本中走 C++ 常量表达式求值，
       唯一可靠的写法是 constexpr int。
 
+【URF 完全未定义时，为什么也能编译通过并正常运行】
+
+C/C++ 标准（C11 §6.8.6）明确规定：
+  "Any such pragma that is not recognized by the implementation is ignored."
+
+#pragma 整行是给编译器的"建议"，参数无效时整行被静默跳过，不报硬错误。
+
+  // 普通代码：URF 未声明 → 硬错误
+  int x = URF;               // error: 'URF' was not declared
+
+  // pragma 行：URF 未声明 → 静默忽略，循环正常运行，仅优化未生效
+  #pragma unroll URF         // 忽略（可能有 warning），循环不展开
+
+NVCC 处理 #pragma unroll 时先做宏展开：
+  · URF 已定义为 #define → 展开为整数，pragma 生效
+  · URF 是 constexpr int → C++ 常量，pragma 生效
+  · URF 完全未定义 → token 留在原处，不是有效整数，pragma 被忽略，
+    循环按原样执行，无展开，无编译错误
+
 
 五、#pragma unroll URF 如何提升 GFLOPS
 ---------------------------------------
