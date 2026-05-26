@@ -579,6 +579,45 @@ CUDA 默认编译模式（无 -rdc=true）：
 - nvlink 执行跨 TU device 链接，ODR 规则对 device 代码生效
 - __device__ 函数若在头文件中定义且被多个 TU include，需加 static 或 inline
 
+【extern __shared__ 的本质】
+
+extern __shared__ T smem[];   // CUDA 专有语法，不参与 C++ 链接性体系
+                               // 这里的 extern 不是 C++ 外部链接，而是 CUDA 的专有标记，
+                               // 含义是：数组大小在编译期未知，由 runtime 在 kernel 启动时分配
+                               // （<<<grid, block, dynSmem>>> 第三个参数指定字节数）
+
+extern __shared__ 不能用 C++ 的内部/外部/无链接来描述：
+- 不做跨 TU 符号解析（不是 C++ 外部链接）
+- 不能从其他 TU 访问（也不符合"外部链接"的可见性语义）
+- 同一 TU 内同名声明要求类型一致（行为又不同于真正的无链接局部变量）
+结论：它是 CUDA 专有构造，强行套用 C++ 链接性分类是类比错误。
+
+若要类比，行为最接近内部链接：
+- 不能被其他 TU 访问，无跨 TU 符号解析
+- 每个 block 持有独立的内存（类似内部链接各 TU 持有独立副本）
+但这只是行为上的近似，机制完全不同：内部链接由链接器实现，
+extern __shared__ 的内存由 CUDA runtime 在 kernel 启动时从 SM 硬件分配。
+
+【模板实例化导致 extern __shared__ 类型冲突的根本原因】
+
+CUDA 编译器在同一 TU 内用符号名标识共享内存布局，要求同名声明类型唯一。
+当 AT_DISPATCH_FLOATING_TYPES 同时实例化 float 和 double 版本时：
+
+  实例1：extern __shared__ float  smem[];   // scalar_t=float
+  实例2：extern __shared__ double smem[];   // scalar_t=double
+
+  // error: declaration is incompatible with previous "smem"
+  // warning: a host variable("smem") redeclared with __shared__
+
+同一符号名 smem 在同一 TU 内被声明为两种不同类型 → 编译器报冲突。
+这是 CUDA 编译器的实现行为，不是 C++ 链接性规则导致的。
+
+标准解法：始终声明为 char[]（类型唯一，不随模板变化），再 reinterpret_cast：
+
+  extern __shared__ char smem_raw[];               // 类型固定，无冲突
+  scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);  // 按需转型
+
+
 CUDA 常量（__constant__）：
 __constant__ float coeff[4];   // 外部链接（device 侧），可从其他 TU 用 extern __constant__ 引用
 
