@@ -1,0 +1,10 @@
+.claude/
+cmake-build-release/
+cmake-build-debug/
+.idea/
+benchmark_results/
+logs/
+matrixValidationFailure.txt
+markdown.md
+cuda-keyring_1.1-1_all.deb
+autotune/
